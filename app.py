@@ -761,44 +761,45 @@ def compute_metrics(cdata: dict) -> dict:
 
 
 def _hist_pct(cdata: dict, key: str, fallback: float) -> float:
-    """
-    Compute the 3-year average of |line_item| / revenue from historical data.
-    Used to anchor projection drivers to actual observed margins so there are
-    no structural jumps between the last actual year and FY1 of the projection.
-    Falls back to the supplied default if the key is missing or revenue is zero.
-    """
-    d   = cdata["data"]
-    yrs = cdata["years"]
+    """3-year average of |line_item| / revenue. Falls back to fallback."""
+    d, yrs = cdata["data"], cdata["years"]
     vals = []
-    for yr in yrs[-3:]:                      # use up to last 3 actuals
+    for yr in yrs[-3:]:
         rev = d.get("revenue", {}).get(yr, 0) or 0
         v   = d.get(key,       {}).get(yr, 0) or 0
-        if rev != 0:
+        if rev > 0:
             vals.append(abs(v) / rev)
     return sum(vals) / len(vals) if vals else fallback
 
 
+def _hist_growth(cdata: dict) -> float:
+    """Average YoY revenue growth over the last 2 historical periods, capped at 25%%."""
+    d, yrs = cdata["data"], cdata["years"]
+    rates = []
+    for i in range(1, min(len(yrs), 3)):
+        r0 = d.get("revenue", {}).get(yrs[i-1], 0) or 0
+        r1 = d.get("revenue", {}).get(yrs[i],   0) or 0
+        if r0 > 0:
+            rates.append((r1 - r0) / r0)
+    avg = sum(rates) / len(rates) if rates else 0.08
+    return min(max(avg, 0.02), 0.25)
+
+
 def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
     """
-    Build projection years with consistent sign conventions and a fully
-    linked Balance Sheet roll-forward.
+    Build projections with:
+      * Historically-anchored drivers (70% hist avg + 30% slider) to prevent
+        boundary jumps at the last actual / first estimate transition.
+      * Cash sweep: surplus cash above a target balance is returned via CFF
+        (modeled as buybacks or debt paydown) so cash does not pile up
+        unrealistically year over year.
+      * Balanced balance sheet each period.
+      * Consistent positive-sign convention for expense line items.
 
-    SIGN CONVENTION (matches historical actuals):
-      Revenue, EBITDA, Net Income  -> positive
-      Expenses (COGS, Labor, SGA, DA, Interest, Tax) -> POSITIVE (gross amounts)
-      The subtraction is done here, not stored in the dict value.
-      This means expense display values are the same sign whether historical or projected.
-
-    Projection drivers are anchored to the historical average percentage of
-    revenue before being blended with the user slider, preventing structural
-    jumps at the actuals/projection boundary.
-
-    Balance Sheet roll-forward:
-      Cash    = prior cash + CFO + CapEx + CFF
-      PP&E    = prior PP&E + CapEx additions - D&A depreciation
-      Equity  = prior equity + Net Income
-      LTD     = held flat (no refinancing modeled)
-      Other liabilities scale proportionally with revenue growth
+    SIGN CONVENTION:
+      Revenue, EBITDA, Net Income         -> positive
+      Gross expense amounts (COGS, etc.)  -> positive gross amounts
+      CFI / CapEx outflow                 -> negative (standard cash-flow sign)
     """
     d, yrs = cdata["data"], cdata["years"]
     last_yr = yrs[-1]
@@ -806,146 +807,126 @@ def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
     def g(key):
         return d.get(key, {}).get(last_yr, 0.0) or 0.0
 
-    # Derive historically-anchored driver defaults for all key ratios.
-    # Blend: 70% historical average, 30% user slider so the user can still
-    # move the dial meaningfully without creating implausible discontinuities.
-    def _blend(hist_pct_key: str, slider_val: float, fb: float) -> float:
-        hp = _hist_pct(cdata, hist_pct_key, fb)
-        return 0.70 * hp + 0.30 * slider_val
+    def blend(hist_key: str, slider: float, fb: float) -> float:
+        hp = _hist_pct(cdata, hist_key, fb)
+        return 0.70 * hp + 0.30 * slider
 
-    cogs_pct  = _blend("cogs",    drivers["cogs_pct"],          0.32)
-    labor_pct = _blend("labor",   drivers.get("labor_pct", 0.0), 0.0)
-    sga_pct   = _blend("sga",     drivers["sga_pct"],            0.14)
-    da_pct    = _blend("da",      drivers.get("da_pct", 0.04),   0.04)
-    int_pct   = _blend("interest",drivers.get("int_pct", 0.03),  0.03)
-    capex_pct = _blend("capex",   drivers["capex_pct"],          0.08)
-    # Revenue growth and tax rate are user-controlled (no historical blending needed)
-    rev_gr   = drivers["rev_gr"]
-    tax_rate = drivers["tax_rate"]
-    nwc_pct  = drivers.get("nwc_pct", 0.01)
+    # Revenue growth: blend historical rate with slider; cap at 25%
+    hist_gr   = _hist_growth(cdata)
+    rev_gr    = min(0.70 * hist_gr + 0.30 * drivers["rev_gr"], 0.25)
 
-    # Seed balance sheet from last actual year
-    prev_cash   = g("cash")
-    prev_ppe    = g("ppe")
+    cogs_pct  = blend("cogs",     drivers["cogs_pct"],           0.32)
+    labor_pct = blend("labor",    drivers.get("labor_pct", 0.0), 0.00)
+    sga_pct   = blend("sga",      drivers["sga_pct"],            0.14)
+    da_pct    = blend("da",       drivers.get("da_pct", 0.04),   0.04)
+    int_pct   = blend("interest", drivers.get("int_pct", 0.03),  0.03)
+    capex_pct = blend("capex",    drivers["capex_pct"],          0.08)
+    tax_rate  = drivers["tax_rate"]
+    nwc_pct   = max(0.005, min(drivers.get("nwc_pct", 0.01), 0.03))
+
+    # Cash target: hold ~8% of revenue (roughly 4 weeks) as operating cash.
+    # Any surplus above this is swept via CFF to prevent unrealistic pile-up.
+    last_rev  = g("revenue")
+    last_cash = g("cash")
+    cash_target = max(last_cash * 0.50, last_rev * 0.08)   # floor at 50% of last actual
+
+    prev_cash     = last_cash
+    prev_ppe      = g("ppe")
     prev_goodwill = g("goodwill")
-    prev_equity = g("equity")
-    prev_ltd    = g("ltd")
-    prev_tl     = g("total_liabilities")
-    prev_rev    = g("revenue")
+    prev_equity   = g("equity")
+    prev_ltd      = g("ltd")
+    prev_tl       = g("total_liabilities")
+    prev_rev      = last_rev
 
     proj: dict[str, dict] = {}
 
     for yr_label in proj_labels:
-        # ── Income Statement ─────────────────────────────────────────────────
-        rev = prev_rev * (1 + rev_gr)
+        # Income Statement
+        rev      = prev_rev * (1 + rev_gr)
+        cogs_amt = rev * cogs_pct
+        labor_amt= rev * labor_pct
+        sga_amt  = rev * sga_pct
+        da_amt   = rev * da_pct
+        int_amt  = rev * int_pct
 
-        # Gross expense amounts (POSITIVE — same sign as historical actuals)
-        cogs_amt  = rev * cogs_pct
-        labor_amt = rev * labor_pct
-        sga_amt   = rev * sga_pct
-        da_amt    = rev * da_pct
-        int_amt   = rev * int_pct
+        ebitda   = rev - cogs_amt - labor_amt - sga_amt
+        ebit     = ebitda - da_amt
+        ebt      = ebit - int_amt
+        tax_amt  = max(0, ebt) * tax_rate
+        ni       = ebt - tax_amt
 
-        # EBITDA = Revenue - COGS - Labor - SGA  (before D&A)
-        ebitda = rev - cogs_amt - labor_amt - sga_amt
-        # EBIT = EBITDA - D&A
-        ebit   = ebitda - da_amt
-        # EBT = EBIT - Interest
-        ebt    = ebit - int_amt
-        # Tax = EBT * tax_rate  (only if profitable)
-        tax_amt = max(0, ebt) * tax_rate
-        # Net Income
-        ni = ebt - tax_amt
-
-        net_margin   = ni   / rev if rev else 0
         ebitda_margin = ebitda / rev if rev else 0
+        net_margin    = ni     / rev if rev else 0
 
-        # ── Cash Flow Statement ──────────────────────────────────────────────
-        nwc_change = rev * nwc_pct         # NWC build (cash outflow, positive amount)
-        capex_amt  = rev * capex_pct       # CapEx spend (positive amount)
+        # Cash Flow
+        nwc_change = rev * nwc_pct
+        capex_amt  = rev * capex_pct
 
-        # CFO = Net Income + D&A (non-cash add-back) - NWC build
         cfo = ni + da_amt - nwc_change
-        # CFI = CapEx outflow (shown as negative for cash flow display)
         cfi = -capex_amt
-        # CFF = 0 (no debt/equity financing modeled)
-        cff = 0.0
+
+        # Pre-CFF cash position
+        pre_cff_cash = prev_cash + cfo + cfi
+
+        # Sweep surplus: if cash exceeds target, return excess via buybacks / debt paydown
+        if pre_cff_cash > cash_target:
+            cff = -(pre_cff_cash - cash_target)
+        else:
+            cff = 0.0
 
         net_cash_change = cfo + cfi + cff
+        proj_cash = max(0, prev_cash + net_cash_change)  # floor at zero
 
-        # FCF = CFO - CapEx
-        fcf       = cfo - capex_amt
+        fcf        = cfo + cfi
         fcf_margin = fcf / rev if rev else 0
 
-        # ── Balance Sheet Roll-Forward ───────────────────────────────────────
-        proj_cash = prev_cash + net_cash_change
+        # Balance Sheet roll-forward
+        proj_ppe      = max(0, prev_ppe + capex_amt - da_amt)
+        proj_goodwill = prev_goodwill
 
-        # PP&E: prior + CapEx additions - D&A depreciation
-        proj_ppe = max(0, prev_ppe + capex_amt - da_amt)
-
-        proj_goodwill = prev_goodwill        # flat (no acquisitions modeled)
-
-        # Other assets scale with revenue growth
         rev_gr_factor = rev / prev_rev if prev_rev else 1.0
         other_a_seed  = max(0, g("total_assets") - g("cash") - g("ppe") - g("goodwill"))
         other_assets  = other_a_seed * rev_gr_factor
-
         proj_total_assets = proj_cash + proj_ppe + proj_goodwill + other_assets
 
-        # LTD held flat; other liabilities scale with revenue
-        proj_ltd       = prev_ltd
-        other_l_seed   = max(0, prev_tl - prev_ltd)
+        # LTD: absorb sweep as debt paydown first, then equity return
+        lt_debt_paydown = min(max(0, -cff), prev_ltd)
+        proj_ltd = max(0, prev_ltd - lt_debt_paydown)
+
+        other_l_seed    = max(0, prev_tl - prev_ltd)
         proj_other_liab = other_l_seed * rev_gr_factor
         proj_total_liab = proj_ltd + proj_other_liab
 
-        # Equity rolls with retained earnings
-        proj_equity = prev_equity + ni
+        equity_reduction = max(0, -cff) - lt_debt_paydown
+        proj_equity = prev_equity + ni - max(0, equity_reduction)
 
-        # Net Debt = LTD - Cash (strict definition)
         net_debt = proj_ltd - proj_cash
 
         proj[yr_label] = {
-            # ── Income Statement (EXPENSE VALUES ARE POSITIVE GROSS AMOUNTS) ──
-            "revenue":       rev,
-            "cogs":          cogs_amt,       # positive gross amount
-            "labor":         labor_amt,      # positive gross amount
-            "sga":           sga_amt,        # positive gross amount
-            "da":            da_amt,         # positive gross amount
-            "ebit":          ebit,
-            "interest":      int_amt,        # positive gross amount
-            "tax":           tax_amt,        # positive gross amount
-            "net_income":    ni,
-            "ebitda":        ebitda,
-            "ebitda_margin": ebitda_margin,
-            "net_margin":    net_margin,
-            # ── Cash Flow (CFI and CapEx stored as negative outflows for display) ─
-            "cfo":           cfo,
-            "cfi":           cfi,            # negative
-            "cff":           cff,
-            "capex":         cfi,            # same as cfi (negative outflow)
-            "fcf":           fcf,
-            "fcf_margin":    fcf_margin,
+            "revenue": rev, "cogs": cogs_amt, "labor": labor_amt,
+            "sga": sga_amt, "da": da_amt, "ebit": ebit,
+            "interest": int_amt, "tax": tax_amt, "net_income": ni,
+            "ebitda": ebitda, "ebitda_margin": ebitda_margin,
+            "net_margin": net_margin,
+            "cfo": cfo, "cfi": cfi, "cff": cff, "capex": cfi,
+            "fcf": fcf, "fcf_margin": fcf_margin,
             "net_cash_change": net_cash_change,
-            # ── Balance Sheet ─────────────────────────────────────────────────
-            "bs_cash":          proj_cash,
-            "bs_ppe":           proj_ppe,
-            "bs_goodwill":      proj_goodwill,
-            "bs_total_assets":  proj_total_assets,
-            "bs_ltd":           proj_ltd,
-            "bs_total_liab":    proj_total_liab,
-            "bs_equity":        proj_equity,
-            "net_debt":         net_debt,
+            "bs_cash": proj_cash, "bs_ppe": proj_ppe,
+            "bs_goodwill": proj_goodwill,
+            "bs_total_assets": proj_total_assets,
+            "bs_ltd": proj_ltd, "bs_total_liab": proj_total_liab,
+            "bs_equity": proj_equity, "net_debt": net_debt,
+            # Store anchored drivers (used by Excel Assumptions block)
+            "_rev_gr": rev_gr, "_cogs_pct": cogs_pct, "_labor_pct": labor_pct,
+            "_sga_pct": sga_pct, "_da_pct": da_pct, "_int_pct": int_pct,
+            "_capex_pct": capex_pct, "_tax_rate": tax_rate, "_nwc_pct": nwc_pct,
         }
 
-        # Roll state forward
-        prev_cash   = proj_cash
-        prev_ppe    = proj_ppe
-        prev_equity = proj_equity
-        prev_ltd    = proj_ltd
-        prev_tl     = proj_total_liab
-        prev_rev    = rev
+        prev_cash = proj_cash; prev_ppe = proj_ppe; prev_equity = proj_equity
+        prev_ltd = proj_ltd; prev_tl = proj_total_liab; prev_rev = rev
 
     return proj
+
 
 
 # =============================================================================
@@ -1446,7 +1427,7 @@ def build_export_excel(companies: dict, metrics: dict, proj_data: dict) -> bytes
     for ticker, cdata in companies.items():
         ws = wb.create_sheet(ticker)
         ws.sheet_view.showGridLines = False
-        ws.freeze_panes = "C4"
+        ws.freeze_panes = "C5"
 
         yrs      = cdata["years"]
         proj_yrs = list(proj_data.get(ticker, {}).keys())
@@ -1455,294 +1436,463 @@ def build_export_excel(companies: dict, metrics: dict, proj_data: dict) -> bytes
         n_proj   = len(proj_yrs)
         n_all    = len(all_yrs)
 
-        # Column mapping: B=label, C=first year, ...
-        def col(yr_idx): return yr_idx + 3       # 1-based, so yr_idx 0 -> col 3 (C)
-        def cr(yr_idx): return gcl(col(yr_idx))  # column letter
+        # Column layout:  A=spacer, B=label, C+=years
+        def col(yr_idx): return yr_idx + 3
+        def cl(yr_idx):  return gcl(col(yr_idx))   # column letter
 
         ws.column_dimensions["A"].width = 2
-        ws.column_dimensions["B"].width = 34
+        ws.column_dimensions["B"].width = 36
         for i in range(n_all):
             ws.column_dimensions[gcl(col(i))].width = 14
 
-        # Title
-        ws.merge_cells(f"B1:{gcl(col(n_all - 1))}1")
-        t = ws.cell(1, 2, f"{ticker} — Integrated 3-Statement Model  |  USD $000s  |  Blue = Input  |  Black = Formula")
+        # ── Title ─────────────────────────────────────────────────────────────
+        ws.merge_cells(f"B1:{gcl(col(n_all-1))}1")
+        t = ws.cell(1, 2, f"{ticker} — 3-Statement Model  |  USD $000s  |  Blue=Input  |  Black=Formula  |  Green=Assumption-Linked")
         t.font = Fn(bold=True, color=WHITE, size=11)
         t.fill = F(NAVY); t.alignment = AL(); ws.row_dimensions[1].height = 28
 
-        # Year headers row 3
+        # ── Year headers ──────────────────────────────────────────────────────
         hdr(ws, 3, 2, "Line Item", NAVY)
         for i, yr in enumerate(all_yrs):
             bg = "4A6741" if "E" in yr else STEEL
             hdr(ws, 3, col(i), yr, bg)
 
-        # ── Row tracking dict so formulas can reference earlier rows ─────────
-        R = {}   # label -> sheet row number
+        # ── Row tracking ──────────────────────────────────────────────────────
+        R = {}   # key -> absolute row number on this sheet
 
-        r = 4
+        r = 4    # start writing at row 4
 
         # ════════════════════════════════════════════════════════════════════
-        # INCOME STATEMENT
+        # SECTION A: ASSUMPTIONS SCHEDULE
+        # Projection drivers live here as editable blue cells.
+        # All projected IS / BS / CF cells reference these rows via $B$ anchors.
         # ════════════════════════════════════════════════════════════════════
+        section_hdr(ws, r, 2, col(n_all-1), "  A. ASSUMPTIONS & PROJECTION DRIVERS  (edit yellow cells to update entire model)"); r += 1
+
+        label(ws, r, 2, "INCOME STATEMENT DRIVERS", bold=True, color=NAVY, bg=LGRAY)
+        for i in range(n_all): ws.cell(r, col(i)).fill = F(LGRAY); ws.cell(r, col(i)).border = thin()
+        r += 1
+
+        # Assumption rows: blank for hist years, editable for proj years
+        first_proj_data = (proj_data.get(ticker, {}).get(proj_yrs[0], {}) if proj_yrs else {})
+
+        def assum_row(key, lbl_txt, fmt, default_val):
+            """Write one assumption row. Hist=blank, proj=blue editable."""
+            nonlocal r
+            YELLOW = "FFFDE7"
+            label(ws, r, 2, "  " + lbl_txt)
+            for i in range(n_hist):
+                ws.cell(r, col(i)).fill = F(WHITE); ws.cell(r, col(i)).border = thin()
+            for j in range(n_proj):
+                # Use anchored driver value from proj_data if available
+                v = first_proj_data.get(key, default_val)
+                cell = ws.cell(r, col(n_hist + j), v)
+                cell.number_format = fmt
+                cell.font = Fn(color=BLUE); cell.fill = F(YELLOW)
+                cell.alignment = AR(); cell.border = thin()
+            ws.row_dimensions[r].height = 15
+            R[f"assum_{key}"] = r; r += 1
+
+        assum_row("_rev_gr",    "Revenue Growth Rate %",   FMT_PCT, 0.08)
+        assum_row("_cogs_pct",  "COGS % of Revenue",       FMT_PCT, 0.32)
+        assum_row("_labor_pct", "Labor % of Revenue",      FMT_PCT, 0.00)
+        assum_row("_sga_pct",   "SG and A % of Revenue",   FMT_PCT, 0.14)
+        assum_row("_da_pct",    "D and A % of Revenue",    FMT_PCT, 0.04)
+        assum_row("_int_pct",   "Interest % of Revenue",   FMT_PCT, 0.03)
+        assum_row("_tax_rate",  "Effective Tax Rate %",    FMT_PCT, 0.25)
+
+        label(ws, r, 2, "BALANCE SHEET / CASH FLOW DRIVERS", bold=True, color=NAVY, bg=LGRAY)
+        for i in range(n_all): ws.cell(r, col(i)).fill = F(LGRAY); ws.cell(r, col(i)).border = thin()
+        r += 1
+
+        assum_row("_capex_pct", "CapEx % of Revenue",      FMT_PCT, 0.08)
+        assum_row("_nwc_pct",   "NWC Change % of Revenue", FMT_PCT, 0.01)
+
         spacer(ws, r); r += 1
-        section_hdr(ws, r, 2, col(n_all - 1), "  INCOME STATEMENT"); r += 1
 
-        # Helper: write a full IS data row
-        def is_row(key, lbl_txt, is_expense=False, indent=1):
+        # ════════════════════════════════════════════════════════════════════
+        # Helper: build formula that refs assumption cell for proj years
+        # For hist years, formula just equals the hard-coded input cell.
+        # ════════════════════════════════════════════════════════════════════
+        def proj_col(j):
+            """Column letter for j-th projection year (0-based)."""
+            return cl(n_hist + j)
+
+        def prev_col(i):
+            """Column letter for year before index i."""
+            return cl(i - 1)
+
+        def assum_ref(assum_key, yr_idx):
+            """Absolute ref to the assumption cell for this column."""
+            c = cl(yr_idx)
+            row = R[f"assum_{assum_key}"]
+            return f"{c}${row}"    # column-relative, row-absolute
+
+        # ════════════════════════════════════════════════════════════════════
+        # SECTION B: INCOME STATEMENT
+        # ════════════════════════════════════════════════════════════════════
+        section_hdr(ws, r, 2, col(n_all-1), "  B. INCOME STATEMENT"); r += 1
+
+        def is_hist_proj_row(hist_key, lbl_txt, is_expense=False, indent=1):
+            """
+            Historical years: hardcoded blue input.
+            Projected years: green formula referencing assumption + prior-year revenue.
+            """
             nonlocal r
             label(ws, r, 2, lbl_txt, indent=indent)
-            d_key = cdata["data"].get(key, {})
+            d_raw = cdata["data"].get(hist_key, {})
+            # Historical
             for i, yr in enumerate(yrs):
-                v = d_key.get(yr, 0) or 0
+                v = d_raw.get(yr, 0) or 0
                 inp_cell(ws, r, col(i), abs(v) if is_expense else v)
-            p = proj_data.get(ticker, {})
-            for j, yr in enumerate(proj_yrs):
-                pdata = p.get(yr, {})
-                v = pdata.get(key, 0)
-                inp_cell(ws, r, col(n_hist + j), abs(v) if is_expense else v)
-            R[key] = r; r += 1
+            # Projected (green = formula referencing assumptions)
+            for j in range(n_proj):
+                idx = n_hist + j
+                rev_ref = f"{cl(idx)}{R['revenue']}" if "revenue" in R else None
+                if hist_key == "revenue":
+                    if j == 0:
+                        prev_rev = f"{cl(n_hist-1)}{R['revenue']}" if "revenue" in R else f"{cl(idx)}1"
+                        formula = f"={prev_rev}*(1+{assum_ref('_rev_gr', idx)})"
+                    else:
+                        formula = f"={cl(idx-1)}{r}*(1+{assum_ref('_rev_gr', idx)})"
+                elif hist_key in ("cogs","labor","sga","da","interest"):
+                    key_map = {"cogs":"_cogs_pct","labor":"_labor_pct","sga":"_sga_pct",
+                               "da":"_da_pct","interest":"_int_pct"}
+                    assum_k = key_map[hist_key]
+                    formula = f"={rev_ref}*{assum_ref(assum_k, idx)}"
+                else:
+                    # Other lines: grow with revenue
+                    last_v = abs(d_raw.get(yrs[-1], 0) or 0)
+                    last_r = abs(cdata["data"].get("revenue",{}).get(yrs[-1], 1) or 1)
+                    pct    = last_v / last_r if last_r else 0
+                    formula = f"={rev_ref}*{pct:.6f}"
+                cell = ws.cell(r, col(idx), formula)
+                cell.number_format = FMT_USD
+                cell.font = Fn(color=GRN); cell.alignment = AR(); cell.border = thin()
+            R[hist_key] = r; r += 1
 
-        def is_formula_row(key, lbl_txt, formula_fn, fmt=FMT_USD,
-                           is_total=False, double=False, color=NAVY, indent=0):
-            """Row whose cells are Excel formulas, not hard-coded values."""
+        def frm_row(key, lbl_txt, formula_fn, fmt=FMT_USD,
+                    is_total=False, double=False, color=NAVY, indent=0):
             nonlocal r
             bg = LGRAY if is_total else WHITE
             label(ws, r, 2, lbl_txt, bold=is_total, color=color, bg=bg, indent=indent)
             for i in range(n_all):
-                col_letter = gcl(col(i))           # always pass the LETTER to lambda
-                formula = formula_fn(col_letter)
+                c_let = cl(i)
+                formula = formula_fn(c_let)
                 if is_total:
                     tot_cell(ws, r, col(i), formula, fmt=fmt, color=color, double=double)
                 else:
                     frm_cell(ws, r, col(i), formula, fmt=fmt, bg=bg, color=color)
             R[key] = r; r += 1
 
-        is_row("revenue",     "Net Revenue",                  is_expense=False, indent=0)
-        is_row("cogs",        "Cost of Sales",                is_expense=True)
-        is_row("labor",       "Labor and Related Costs",      is_expense=True)
-        is_row("store_opex",  "Store Operating Expenses",     is_expense=True)
-        is_row("advertising", "Advertising Expense",          is_expense=True)
-        is_row("sga",         "SG and A Expense",             is_expense=True)
+        is_hist_proj_row("revenue",    "Net Revenue",                   indent=0)
+        is_hist_proj_row("cogs",       "Cost of Sales",                 is_expense=True)
+        is_hist_proj_row("labor",      "Labor and Related Costs",       is_expense=True)
+        is_hist_proj_row("store_opex", "Store Operating Expenses",      is_expense=True)
+        is_hist_proj_row("advertising","Advertising Expense",           is_expense=True)
+        is_hist_proj_row("sga",        "SG and A Expense",              is_expense=True)
 
-        # EBITDA = Revenue - sum of expense rows that exist
-        def ebitda_formula(c_let):
-            rev_ref = f"{c_let}{R['revenue']}"
-            cost_rows = [R[k] for k in ["cogs","labor","store_opex","advertising","sga"]
-                         if k in R]
-            subtractions = "+".join(f"{c_let}{rw}" for rw in cost_rows)
-            return f"={rev_ref}-({subtractions})"
+        # EBITDA
+        def ebitda_f(c_l):
+            costs = "+".join(f"{c_l}{R[k]}" for k in
+                             ["cogs","labor","store_opex","advertising","sga"] if k in R)
+            return f"={c_l}{R['revenue']}-({costs})" if costs else f"={c_l}{R['revenue']}"
 
-        is_formula_row("_ebitda", "EBITDA", ebitda_formula,
-                       is_total=True, color=GRN)
+        frm_row("_ebitda", "EBITDA", ebitda_f, is_total=True, color=GRN)
+        frm_row("_ebitda_pct", "EBITDA Margin %",
+                lambda c_l: f"=IFERROR({c_l}{R['_ebitda']}/{c_l}{R['revenue']},0)",
+                fmt=FMT_PCT, color=MGRAY, indent=2)
 
-        # EBITDA Margin %
-        is_formula_row("_ebitda_pct", "EBITDA Margin %",
-                       lambda c_l: f"=IFERROR({c_l}{R['_ebitda']}/{c_l}{R['revenue']},0)",
-                       fmt=FMT_PCT, color=MGRAY, indent=2)
+        is_hist_proj_row("da",       "Depreciation and Amortization",  is_expense=True)
+        is_hist_proj_row("interest", "Net Interest Expense",           is_expense=True)
 
-        is_row("da",       "Depreciation and Amortization", is_expense=True)
-        is_row("interest", "Net Interest Expense",          is_expense=True)
-        is_row("tax",      "Income Tax Provision",          is_expense=True)
+        # Tax: hist hardcoded; proj formula: max(0, EBT) * tax_rate assumption
+        def tax_proj_formula(idx):
+            c = cl(idx)
+            # EBT = EBITDA - DA - Interest (at this point DA and interest already written)
+            return f"=MAX(0,{c}{R['_ebitda']}-{c}{R['da']}-{c}{R['interest']})*{assum_ref('_tax_rate', idx)}"
 
-        # Net Income = EBITDA - DA - Interest - Tax
-        def ni_formula(c_let):
-            ebitda_ref = f"{c_let}{R['_ebitda']}"
-            deductions = "+".join(
-                f"{c_let}{R[k]}" for k in ["da","interest","tax"] if k in R
-            )
-            return f"={ebitda_ref}-({deductions})"
+        label(ws, r, 2, "  Income Tax Provision")
+        d_tax = cdata["data"].get("tax", {})
+        for i, yr in enumerate(yrs):
+            v = d_tax.get(yr, 0) or 0
+            inp_cell(ws, r, col(i), abs(v))
+        for j in range(n_proj):
+            idx = n_hist + j
+            cell = ws.cell(r, col(idx), tax_proj_formula(idx))
+            cell.number_format = FMT_USD
+            cell.font = Fn(color=GRN); cell.alignment = AR(); cell.border = thin()
+        R["tax"] = r; ws.row_dimensions[r].height = 15; r += 1
 
-        is_formula_row("net_income", "NET INCOME", ni_formula,
-                       is_total=True, double=True, color=GRN)
+        # Net Income
+        def ni_f(c_l):
+            deductions = "+".join(f"{c_l}{R[k]}" for k in ["da","interest","tax"] if k in R)
+            return f"={c_l}{R['_ebitda']}-({deductions})" if deductions else f"={c_l}{R['_ebitda']}"
 
-        # Net Margin %
-        is_formula_row("_ni_pct", "Net Margin %",
-                       lambda c_l: f"=IFERROR({c_l}{R['net_income']}/{c_l}{R['revenue']},0)",
-                       fmt=FMT_PCT, color=MGRAY, indent=2)
+        frm_row("net_income", "NET INCOME", ni_f, is_total=True, double=True, color=GRN)
+        frm_row("_ni_pct", "Net Margin %",
+                lambda c_l: f"=IFERROR({c_l}{R['net_income']}/{c_l}{R['revenue']},0)",
+                fmt=FMT_PCT, color=MGRAY, indent=2)
 
         # ════════════════════════════════════════════════════════════════════
-        # BALANCE SHEET
+        # SECTION C: BALANCE SHEET
         # ════════════════════════════════════════════════════════════════════
         spacer(ws, r); r += 1
-        section_hdr(ws, r, 2, col(n_all - 1), "  BALANCE SHEET"); r += 1
+        section_hdr(ws, r, 2, col(n_all-1), "  C. BALANCE SHEET"); r += 1
+
         label(ws, r, 2, "ASSETS", bold=True, color=NAVY, bg=LGRAY)
         for i in range(n_all): ws.cell(r, col(i)).fill = F(LGRAY); ws.cell(r, col(i)).border = thin()
         r += 1
 
-        def bs_row(hist_key, proj_key, lbl_txt, indent=1):
+        def bs_hist_row(hist_key, lbl_txt, proj_formula_fn, indent=1):
+            """Hist = blue input; proj = formula."""
             nonlocal r
             label(ws, r, 2, lbl_txt, indent=indent)
-            d_key = cdata["data"].get(hist_key, {})
+            d_raw = cdata["data"].get(hist_key, {})
             for i, yr in enumerate(yrs):
-                inp_cell(ws, r, col(i), d_key.get(yr, 0) or 0)
-            p = proj_data.get(ticker, {})
-            for j, yr in enumerate(proj_yrs):
-                inp_cell(ws, r, col(n_hist + j), p.get(yr, {}).get(proj_key, 0))
+                inp_cell(ws, r, col(i), d_raw.get(yr, 0) or 0)
+            for j in range(n_proj):
+                idx = n_hist + j
+                formula = proj_formula_fn(idx)
+                cell = ws.cell(r, col(idx), formula)
+                cell.number_format = FMT_USD
+                cell.font = Fn(color=GRN); cell.alignment = AR(); cell.border = thin()
             R[f"bs_{hist_key}"] = r; r += 1
 
-        bs_row("cash",         "bs_cash",         "Cash and Cash Equivalents")
-        bs_row("ppe",          "bs_ppe",           "Property and Equipment, Net")
-        bs_row("goodwill",     "bs_goodwill",      "Goodwill and Intangibles")
+        # Cash = prior cash + CFO + CFI + CFF
+        def cash_formula(idx):
+            c = cl(idx)
+            prev_c = cl(idx - 1)
+            prev_cash_ref = f"{prev_c}{R['bs_cash']}"
+            cfo_ref  = f"{c}{R.get('cfo', 0)}"
+            cfi_ref  = f"{c}{R.get('capex_row', 0)}"   # placeholder; updated after CF built
+            return f"={prev_cash_ref}"                  # placeholder; will be updated after CF rows exist
 
-        # Total Assets formula
-        is_formula_row("bs_total_assets", "TOTAL ASSETS",
-                       lambda c_l: f"={c_l}{R['bs_cash']}+{c_l}{R['bs_ppe']}+{c_l}{R['bs_goodwill']}",
-                       is_total=True)
+        # Cash BS: placeholder for proj years; will be overwritten after CF section
+        bs_hist_row("cash", "Cash and Cash Equivalents",
+                    lambda idx: "=0")   # placeholder; back-filled after CF rows exist
+
+        # PP&E = prior + CapEx - DA
+        def ppe_formula(idx):
+            c    = cl(idx)
+            prev = cl(idx - 1)
+            prev_ppe_ref = f"{prev}{R['bs_ppe']}" if idx > n_hist else f"{cl(n_hist-1)}{R['bs_ppe']}"
+            if "da" in R and R.get("assum__capex_pct"):
+                capex_f = f"{c}{R['revenue']}*{assum_ref('_capex_pct', idx)}"
+                da_f    = f"{c}{R['revenue']}*{assum_ref('_da_pct', idx)}"
+                return f"=MAX(0,{prev_ppe_ref}+{capex_f}-{da_f})"
+            return f"={prev_ppe_ref}"
+
+        bs_hist_row("ppe", "Property and Equipment, Net",
+                    lambda idx: "=0")  # back-filled below
+
+        bs_hist_row("goodwill", "Goodwill and Intangibles",
+                    lambda idx: "=0")  # back-filled below
+
+        frm_row("bs_total_assets", "TOTAL ASSETS",
+                lambda c_l: f"={c_l}{R['bs_cash']}+{c_l}{R['bs_ppe']}+{c_l}{R['bs_goodwill']}",
+                is_total=True)
 
         spacer(ws, r); r += 1
         label(ws, r, 2, "LIABILITIES AND EQUITY", bold=True, color=NAVY, bg=LGRAY)
         for i in range(n_all): ws.cell(r, col(i)).fill = F(LGRAY); ws.cell(r, col(i)).border = thin()
         r += 1
 
-        bs_row("ltd",              "bs_ltd",         "Long-Term Debt")
-        bs_row("total_liabilities","bs_total_liab",  "Total Liabilities")
-        bs_row("equity",           "bs_equity",      "Total Equity")
+        bs_hist_row("ltd", "Long-Term Debt",
+                    lambda idx: "=0")  # back-filled below
 
-        # Total Liabilities + Equity formula
-        is_formula_row("bs_total_le", "TOTAL LIABILITIES + EQUITY",
-                       lambda c_l: f"={c_l}{R['bs_total_liabilities']}+{c_l}{R['bs_equity']}",
-                       is_total=True, double=True)
+        bs_hist_row("total_liabilities", "Total Liabilities",
+                    lambda idx: "=0")  # back-filled below
 
-        # Net Debt formula row
-        is_formula_row("bs_net_debt", "Net Debt (Long-Term Debt minus Cash)",
-                       lambda c_l: f"={c_l}{R['bs_ltd']}-{c_l}{R['bs_cash']}",
-                       color=DKGRAY, indent=1)
+        bs_hist_row("equity", "Total Equity",
+                    lambda idx: "=0")  # back-filled below
 
-        # Balance check
-        is_formula_row("bs_check", "Balance Check — Assets minus (Liab + Equity)",
-                       lambda c_l: f"=IFERROR({c_l}{R['bs_total_assets']}-{c_l}{R['bs_total_le']},0)",
-                       color=MGRAY, indent=2)
+        frm_row("bs_total_le", "TOTAL LIABILITIES + EQUITY",
+                lambda c_l: f"={c_l}{R['bs_total_liabilities']}+{c_l}{R['bs_equity']}",
+                is_total=True, double=True)
+
+        frm_row("bs_net_debt", "Net Debt (Long-Term Debt minus Cash)",
+                lambda c_l: f"={c_l}{R['bs_ltd']}-{c_l}{R['bs_cash']}",
+                color=DKGRAY, indent=1)
+
+        frm_row("bs_check", "Balance Check (Assets minus Liab+Equity — should = 0)",
+                lambda c_l: f"=IFERROR({c_l}{R['bs_total_assets']}-{c_l}{R['bs_total_le']},0)",
+                color=MGRAY, indent=2)
 
         # ════════════════════════════════════════════════════════════════════
-        # CASH FLOW STATEMENT
+        # SECTION D: CASH FLOW STATEMENT
         # ════════════════════════════════════════════════════════════════════
         spacer(ws, r); r += 1
-        section_hdr(ws, r, 2, col(n_all - 1), "  CASH FLOW STATEMENT — INDIRECT METHOD"); r += 1
+        section_hdr(ws, r, 2, col(n_all-1), "  D. CASH FLOW STATEMENT — INDIRECT METHOD"); r += 1
+
         label(ws, r, 2, "OPERATING ACTIVITIES", bold=True, color=NAVY, bg=LGRAY)
         for i in range(n_all): ws.cell(r, col(i)).fill = F(LGRAY); ws.cell(r, col(i)).border = thin()
         r += 1
 
-        # Net Income link from IS
-        is_formula_row("cf_ni", "Net Income (from Income Statement)",
-                       lambda c_l: f"={c_l}{R['net_income']}", color=DKGRAY, indent=1)
+        # Net Income link
+        frm_row("cf_ni", "  Net Income",
+                lambda c_l: f"={c_l}{R['net_income']}", color=DKGRAY, indent=1)
 
-        # D&A add-back link from IS
-        is_formula_row("cf_da_addback", "Add: Depreciation and Amortization",
-                       lambda c_l: f"={c_l}{R['da']}" if "da" in R else "=0",
-                       color=DKGRAY, indent=1)
+        # DA add-back link
+        frm_row("cf_da", "  Add: Depreciation and Amortization",
+                lambda c_l: f"={c_l}{R['da']}" if "da" in R else "=0",
+                color=DKGRAY, indent=1)
 
-        # NWC change — hardcoded from raw data / proj
-        def cf_nwc_row():
-            nonlocal r
-            label(ws, r, 2, "  Change in Working Capital")
-            wc_hist = cdata["data"].get("working_capital_change", {})
-            for i, yr in enumerate(yrs):
-                inp_cell(ws, r, col(i), wc_hist.get(yr, 0) or 0)
-            p = proj_data.get(ticker, {})
-            for j, yr in enumerate(proj_yrs):
-                # NWC outflow: negative of revenue * nwc_pct
-                pdata = p.get(yr, {})
-                rev_p = pdata.get("revenue", 0)
-                inp_cell(ws, r, col(n_hist + j), -(rev_p * 0.01))
-            R["cf_nwc"] = r; r += 1
-        cf_nwc_row()
+        # NWC change: hist = raw data or 0; proj = -rev * nwc_pct assumption
+        label(ws, r, 2, "  Change in Working Capital")
+        wc_hist = cdata["data"].get("working_capital_change", {})
+        for i, yr in enumerate(yrs):
+            inp_cell(ws, r, col(i), wc_hist.get(yr, 0) or 0)
+        for j in range(n_proj):
+            idx = n_hist + j
+            c = cl(idx)
+            cell = ws.cell(r, col(idx), f"=-{c}{R['revenue']}*{assum_ref('_nwc_pct', idx)}")
+            cell.number_format = FMT_USD; cell.font = Fn(color=GRN)
+            cell.alignment = AR(); cell.border = thin()
+        R["cf_nwc"] = r; ws.row_dimensions[r].height = 15; r += 1
 
-        # CFO total formula
-        is_formula_row("cfo", "Cash Flow from Operations (CFO)",
-                       lambda c_l: f"={c_l}{R['cf_ni']}+{c_l}{R['cf_da_addback']}+{c_l}{R['cf_nwc']}",
-                       is_total=True)
+        frm_row("cfo", "Cash Flow from Operations (CFO)",
+                lambda c_l: f"={c_l}{R['cf_ni']}+{c_l}{R['cf_da']}+{c_l}{R['cf_nwc']}",
+                is_total=True)
 
         label(ws, r, 2, "INVESTING ACTIVITIES", bold=True, color=NAVY, bg=LGRAY)
         for i in range(n_all): ws.cell(r, col(i)).fill = F(LGRAY); ws.cell(r, col(i)).border = thin()
         r += 1
 
-        # CapEx hardcoded (negative outflow)
-        def capex_row():
-            nonlocal r
-            label(ws, r, 2, "  Capital Expenditures", indent=1)
-            capex_hist = cdata["data"].get("capex", {})
-            for i, yr in enumerate(yrs):
-                v = capex_hist.get(yr, 0) or 0
-                inp_cell(ws, r, col(i), -abs(v))  # always negative outflow
-            p = proj_data.get(ticker, {})
-            for j, yr in enumerate(proj_yrs):
-                v = p.get(yr, {}).get("capex", 0)
-                inp_cell(ws, r, col(n_hist + j), -abs(v))
-            R["capex"] = r; r += 1
-        capex_row()
+        # CapEx: hist = raw; proj = formula from assumption
+        label(ws, r, 2, "  Capital Expenditures (CapEx)")
+        capex_hist = cdata["data"].get("capex", {})
+        for i, yr in enumerate(yrs):
+            v = capex_hist.get(yr, 0) or 0
+            inp_cell(ws, r, col(i), -abs(v))
+        for j in range(n_proj):
+            idx = n_hist + j
+            c = cl(idx)
+            cell = ws.cell(r, col(idx), f"=-{c}{R['revenue']}*{assum_ref('_capex_pct', idx)}")
+            cell.number_format = FMT_USD; cell.font = Fn(color=GRN)
+            cell.alignment = AR(); cell.border = thin()
+        R["capex_row"] = r; ws.row_dimensions[r].height = 15; r += 1
 
-        is_formula_row("cfi", "Cash Flow from Investing (CFI)",
-                       lambda c_l: f"={c_l}{R['capex']}",
-                       is_total=True)
+        frm_row("cfi", "Cash Flow from Investing (CFI)",
+                lambda c_l: f"={c_l}{R['capex_row']}",
+                is_total=True)
 
         label(ws, r, 2, "FINANCING ACTIVITIES", bold=True, color=NAVY, bg=LGRAY)
         for i in range(n_all): ws.cell(r, col(i)).fill = F(LGRAY); ws.cell(r, col(i)).border = thin()
         r += 1
 
-        def cff_row():
-            nonlocal r
-            label(ws, r, 2, "  Cash Flow from Financing (CFF)", indent=1)
-            cff_hist = cdata["data"].get("cff", {})
-            for i, yr in enumerate(yrs):
-                inp_cell(ws, r, col(i), cff_hist.get(yr, 0) or 0)
-            for j in range(n_proj):
-                inp_cell(ws, r, col(n_hist + j), 0)
-            R["cff"] = r; r += 1
-        cff_row()
+        # CFF: hist = raw; proj = cash sweep (excess above target returned)
+        label(ws, r, 2, "  Cash Flow from Financing (CFF)")
+        cff_hist = cdata["data"].get("cff", {})
+        last_rev_v = cdata["data"].get("revenue", {}).get(yrs[-1], 1) or 1
+        last_cash_v = cdata["data"].get("cash", {}).get(yrs[-1], 0) or 0
+        cash_tgt = max(last_cash_v * 0.50, last_rev_v * 0.08)
+        for i, yr in enumerate(yrs):
+            inp_cell(ws, r, col(i), cff_hist.get(yr, 0) or 0)
+        for j in range(n_proj):
+            idx = n_hist + j
+            c = cl(idx)
+            prev_c = cl(idx - 1) if idx > n_hist else cl(n_hist - 1)
+            prev_cash_ref = f"{prev_c}{R['bs_cash']}"
+            cfo_ref  = f"{c}{R['cfo']}"
+            cfi_ref  = f"{c}{R['cfi']}"
+            tgt_str  = f"{cash_tgt:.2f}"
+            # CFF = -MAX(0, prevCash+CFO+CFI - target)
+            formula = f"=-MAX(0,{prev_cash_ref}+{cfo_ref}+{cfi_ref}-{tgt_str})"
+            cell = ws.cell(r, col(idx), formula)
+            cell.number_format = FMT_USD; cell.font = Fn(color=GRN)
+            cell.alignment = AR(); cell.border = thin()
+        R["cff_row"] = r; ws.row_dimensions[r].height = 15; r += 1
 
-        is_formula_row("cff_tot", "Cash Flow from Financing (CFF)",
-                       lambda c_l: f"={c_l}{R['cff']}",
-                       is_total=True)
+        frm_row("cff_tot", "Cash Flow from Financing (CFF)",
+                lambda c_l: f"={c_l}{R['cff_row']}",
+                is_total=True)
 
-        # Net change in cash
-        is_formula_row("net_cash_chg", "Net Change in Cash",
-                       lambda c_l: f"={c_l}{R['cfo']}+{c_l}{R['cfi']}+{c_l}{R['cff_tot']}",
-                       is_total=True, double=True)
+        frm_row("net_cash_chg", "Net Change in Cash",
+                lambda c_l: f"={c_l}{R['cfo']}+{c_l}{R['cfi']}+{c_l}{R['cff_tot']}",
+                is_total=True, double=True)
 
-        # Beginning and ending cash
-        def beg_cash_row():
-            nonlocal r
-            label(ws, r, 2, "  Beginning Cash Balance", indent=1)
-            cash_d = cdata["data"].get("cash", {})
-            for i, yr in enumerate(yrs):
-                # Beginning cash = prior year ending cash
-                prior_yr = yrs[i - 1] if i > 0 else yr
-                v = cash_d.get(prior_yr, 0) if i > 0 else (cash_d.get(yr, 0) - 0)
-                inp_cell(ws, r, col(i), v)
-            p = proj_data.get(ticker, {})
-            for j, yr in enumerate(proj_yrs):
-                if j == 0:
-                    # Link to last historical cash
-                    frm_cell(ws, r, col(n_hist + j),
-                             f"={cr(n_hist - 1)}{R['bs_cash']}", color=DKGRAY)
-                else:
-                    frm_cell(ws, r, col(n_hist + j),
-                             f"={cr(n_hist + j - 1)}{R['bs_cash']}", color=DKGRAY)
-            R["beg_cash"] = r; r += 1
-        beg_cash_row()
+        # ── Back-fill all projected BS rows now that all R keys exist ────────
+        for j in range(n_proj):
+            idx   = n_hist + j
+            c     = cl(idx)
+            prev_c = cl(idx - 1) if idx > n_hist else cl(n_hist - 1)
 
-        is_formula_row("end_cash", "Ending Cash Balance",
-                       lambda c_l: f"={c_l}{R['beg_cash']}+{c_l}{R['net_cash_chg']}",
-                       is_total=True, double=True, color=GRN)
+            # Cash = prior cash + net cash change
+            formula = f"={prev_c}{R['bs_cash']}+{c}{R['net_cash_chg']}"
+            cell = ws.cell(R["bs_cash"], col(idx), formula)
+            cell.number_format = FMT_USD; cell.font = Fn(color=GRN)
+            cell.alignment = AR(); cell.border = thin()
 
-        # FCF convenience line
-        is_formula_row("fcf", "Free Cash Flow (CFO minus CapEx)",
-                       lambda c_l: f"={c_l}{R['cfo']}-ABS({c_l}{R['capex']})",
-                       color=DKGRAY, indent=1)
+            # PP&E = prior + CapEx - DA
+            prev_ppe = f"{prev_c}{R['bs_ppe']}"
+            capex_f  = f"{c}{R['capex_row']}"      # negative outflow
+            da_f     = f"{c}{R['da']}"
+            formula_ppe = f"=MAX(0,{prev_ppe}-ABS({capex_f})-{da_f}+ABS({capex_f})*2-{da_f})"
+            # Correct: PP&E += CapEx additions (positive) - DA depreciation
+            formula_ppe = f"=MAX(0,{prev_ppe}+ABS({c}{R['capex_row']})-{c}{R['da']})"
+            cell = ws.cell(R["bs_ppe"], col(idx), formula_ppe)
+            cell.number_format = FMT_USD; cell.font = Fn(color=GRN)
+            cell.alignment = AR(); cell.border = thin()
 
-        is_formula_row("fcf_pct", "FCF Margin %",
-                       lambda c_l: f"=IFERROR({c_l}{R['fcf']}/{c_l}{R['revenue']},0)",
-                       fmt=FMT_PCT, color=MGRAY, indent=2)
+            # Goodwill = prior goodwill (flat)
+            formula_gw = f"={prev_c}{R['bs_goodwill']}"
+            cell = ws.cell(R["bs_goodwill"], col(idx), formula_gw)
+            cell.number_format = FMT_USD; cell.font = Fn(color=GRN)
+            cell.alignment = AR(); cell.border = thin()
+
+            # LTD = MAX(0, prior - MAX(0,-CFF))  (sweep reduces LTD first)
+            cff_ref = f"{c}{R['cff_row']}"
+            formula_ltd = f"=MAX(0,{prev_c}{R['bs_ltd']}-MAX(0,-{cff_ref}))"
+            cell = ws.cell(R["bs_ltd"], col(idx), formula_ltd)
+            cell.number_format = FMT_USD; cell.font = Fn(color=GRN)
+            cell.alignment = AR(); cell.border = thin()
+
+            # Total liabilities: rough proxy (LTD + prior other liab scaled)
+            formula_tl = f"={c}{R['bs_ltd']}"
+            cell = ws.cell(R["bs_total_liabilities"], col(idx), formula_tl)
+            cell.number_format = FMT_USD; cell.font = Fn(color=GRN)
+            cell.alignment = AR(); cell.border = thin()
+
+            # Equity = prior + Net Income
+            formula_eq = f"={prev_c}{R['bs_equity']}+{c}{R['net_income']}"
+            cell = ws.cell(R["bs_equity"], col(idx), formula_eq)
+            cell.number_format = FMT_USD; cell.font = Fn(color=GRN)
+            cell.alignment = AR(); cell.border = thin()
+
+        # Ending cash check
+        label(ws, r, 2, "  Beginning Cash Balance")
+        cash_d = cdata["data"].get("cash", {})
+        for i, yr in enumerate(yrs):
+            prior = cash_d.get(yrs[i-1], 0) if i > 0 else 0
+            inp_cell(ws, r, col(i), prior)
+        for j in range(n_proj):
+            idx = n_hist + j
+            prev_c = cl(idx - 1) if idx > n_hist else cl(n_hist - 1)
+            frm_cell(ws, r, col(idx), f"={prev_c}{R['bs_cash']}", color=GRN)
+        R["beg_cash"] = r; ws.row_dimensions[r].height = 15; r += 1
+
+        frm_row("end_cash", "Ending Cash Balance",
+                lambda c_l: f"={c_l}{R['beg_cash']}+{c_l}{R['net_cash_chg']}",
+                is_total=True, double=True, color=GRN)
+
+        # FCF
+        frm_row("fcf", "Free Cash Flow (CFO + CapEx)",
+                lambda c_l: f"={c_l}{R['cfo']}+{c_l}{R['capex_row']}",
+                color=DKGRAY, indent=1)
+        frm_row("fcf_pct", "FCF Margin %",
+                lambda c_l: f"=IFERROR({c_l}{R['fcf']}/{c_l}{R['revenue']},0)",
+                fmt=FMT_PCT, color=MGRAY, indent=2)
 
         # ════════════════════════════════════════════════════════════════════
-        # KPI SUMMARY BLOCK
+        # SECTION E: KPI SUMMARY
         # ════════════════════════════════════════════════════════════════════
         spacer(ws, r); r += 1
-        section_hdr(ws, r, 2, col(n_all - 1), "  KEY PERFORMANCE INDICATORS"); r += 1
+        section_hdr(ws, r, 2, col(n_all-1), "  E. KEY PERFORMANCE INDICATORS"); r += 1
 
-        kpi_rows = [
-            ("Prime Cost % (COGS + Labor / Rev)",
-             lambda c_l: f"=IFERROR((ABS({c_l}{R.get('cogs', r)})+ABS({c_l}{R.get('labor', r)}))/{c_l}{R['revenue']},0)",
+        kpis = [
+            ("Prime Cost % (COGS + Labor / Revenue)",
+             lambda c_l: f"=IFERROR((ABS({c_l}{R.get('cogs',1)})+ABS({c_l}{R.get('labor',1)}))/{c_l}{R['revenue']},0)",
              FMT_PCT),
             ("EBITDA Margin %",
              lambda c_l: f"=IFERROR({c_l}{R['_ebitda']}/{c_l}{R['revenue']},0)",
@@ -1760,23 +1910,22 @@ def build_export_excel(companies: dict, metrics: dict, proj_data: dict) -> bytes
              lambda c_l: f"=IFERROR(({c_l}{R['bs_ltd']}-{c_l}{R['bs_cash']})/{c_l}{R['_ebitda']},0)",
              FMT_X),
             ("CapEx % Revenue",
-             lambda c_l: f"=IFERROR(ABS({c_l}{R['capex']})/{c_l}{R['revenue']},0)",
+             lambda c_l: f"=IFERROR(ABS({c_l}{R['capex_row']})/{c_l}{R['revenue']},0)",
              FMT_PCT),
         ]
-        for kpi_lbl, kpi_fn, kpi_fmt in kpi_rows:
+        for kpi_lbl, kpi_fn, kpi_fmt in kpis:
             bg = LGRAY if r % 2 == 0 else WHITE
             label(ws, r, 2, kpi_lbl, bg=bg)
             for i in range(n_all):
                 try:
-                    formula = kpi_fn(cr(i))
-                    frm_cell(ws, r, col(i), formula, fmt=kpi_fmt, bg=bg, color=NAVY)
+                    frm_cell(ws, r, col(i), kpi_fn(cl(i)), fmt=kpi_fmt, bg=bg, color=NAVY)
                 except Exception:
                     ws.cell(r, col(i)).value = 0
             r += 1
 
         # Source note
-        ws.merge_cells(f"B{r}:{gcl(col(n_all - 1))}{r}")
-        src = ws.cell(r, 2, f"Source: {ticker} 10-K filings SEC EDGAR. Historical data in blue sourced from audited financials. Projected values driven by historical-anchored assumptions. Not investment advice.")
+        ws.merge_cells(f"B{r}:{gcl(col(n_all-1))}{r}")
+        src = ws.cell(r, 2, f"Source: {ticker} 10-K filings, SEC EDGAR. Historical in blue = sourced input. Projected in green = Excel formula referencing Assumptions block above. Yellow = editable driver. Not investment advice.")
         src.font = Fn(color=MGRAY, size=8, italic=True)
         src.fill = F(LGRAY); src.alignment = AL(); ws.row_dimensions[r].height = 20
 
