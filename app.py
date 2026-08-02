@@ -37,44 +37,56 @@ st.set_page_config(
 # =============================================================================
 st.markdown("""
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+
   .main  { background: #0F1117; }
-  .stApp { background: #0F1117; }
+  .stApp { background: #0F1117; font-family: 'Inter', sans-serif; }
   .block-container { padding-top: 1.5rem; }
 
   .kpi-card {
     background: linear-gradient(135deg, #1B365D 0%, #2D5F8A 100%);
     border: 1px solid #2D5F8A;
     border-radius: 10px;
-    padding: 18px 22px;
+    padding: 16px 18px 14px;
     text-align: center;
     margin-bottom: 10px;
+    min-height: 100px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
   }
-  .kpi-label  { font-size:11px; font-weight:600; color:#A8C8E8;
-                text-transform:uppercase; letter-spacing:1.4px; margin-bottom:6px; }
-  .kpi-value  { font-size:26px; font-weight:700; color:#FFFFFF; }
-  .kpi-delta  { font-size:11px; color:#52C97C; margin-top:4px; }
-  .kpi-neg    { color:#FF6B6B; }
+  .kpi-label {
+    font-size: 10px; font-weight: 600; color: #A8C8E8;
+    text-transform: uppercase; letter-spacing: 1.2px;
+    margin-bottom: 8px; line-height: 1.3;
+  }
+  .kpi-value { font-size: 24px; font-weight: 700; color: #FFFFFF; line-height: 1.1; }
+  .kpi-delta { font-size: 11px; color: #52C97C; margin-top: 6px; }
+  .kpi-neg   { color: #FF6B6B; }
 
   .section-hdr {
-    font-size:15px; font-weight:700; color:#EAF2FA;
-    border-left:4px solid #2D5F8A;
-    padding-left:10px; margin:22px 0 14px;
+    font-size: 14px; font-weight: 700; color: #EAF2FA;
+    border-left: 4px solid #2D5F8A;
+    padding-left: 10px; margin: 20px 0 12px;
   }
   .method-card {
-    background:#161B27; border:1px solid #1F2937;
-    border-radius:8px; padding:16px 20px; margin-bottom:10px;
+    background: #161B27; border: 1px solid #1F2937;
+    border-radius: 8px; padding: 16px 20px; margin-bottom: 10px;
   }
-  .method-title { font-size:13px; font-weight:700; color:#60A5FA; margin-bottom:6px; }
-  .method-body  { font-size:12px; color:#9CA3AF; line-height:1.7; }
+  .method-title { font-size: 13px; font-weight: 700; color: #60A5FA; margin-bottom: 6px; }
+  .method-body  { font-size: 12px; color: #9CA3AF; line-height: 1.7; }
 
   div[data-testid="stSidebar"] {
-    background:#111827; border-right:1px solid #1F2937;
+    background: #111827; border-right: 1px solid #1F2937;
   }
-  .stTabs [data-baseweb="tab-list"] { background:#111827; border-radius:8px; }
-  .stTabs [data-baseweb="tab"]      { color:#9CA3AF; }
-  .stTabs [aria-selected="true"]    { color:#60A5FA !important; background:#1F2937 !important; }
-  h1,h2,h3 { color:#EAF2FA !important; }
-  .stDataFrame { background:#161B27; }
+  .stTabs [data-baseweb="tab-list"] { background: #111827; border-radius: 8px; }
+  .stTabs [data-baseweb="tab"]      { color: #9CA3AF; }
+  .stTabs [aria-selected="true"]    { color: #60A5FA !important; background: #1F2937 !important; }
+  h1, h2, h3 { color: #EAF2FA !important; }
+  .stDataFrame { background: #161B27; }
+
+  /* Ensure markdown divs inside st.columns render correctly */
+  [data-testid="column"] .kpi-card { width: 100%; box-sizing: border-box; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -715,50 +727,109 @@ def parse_multiple_files(
 # =============================================================================
 # METRICS ENGINE
 # =============================================================================
+# =============================================================================
+# SAFE ARITHMETIC HELPERS
+# Every ratio and margin calculation in the app goes through safe_div so that
+# missing data, zero denominators, and NaN inputs never raise exceptions or
+# produce inf values.
+# =============================================================================
+def safe_div(numerator: float, denominator: float, fallback: float = 0.0) -> float:
+    """Return numerator / denominator, or fallback if denominator is zero or either value is NaN."""
+    try:
+        n = float(numerator)
+        d = float(denominator)
+        if d == 0 or not (d == d) or not (n == n):   # NaN check: NaN != NaN
+            return fallback
+        return n / d
+    except (TypeError, ValueError, ZeroDivisionError):
+        return fallback
+
+
+def safe_float(v, fallback: float = 0.0) -> float:
+    """Coerce v to float; return fallback on any error or NaN."""
+    try:
+        result = float(v)
+        return result if result == result else fallback   # NaN guard
+    except (TypeError, ValueError):
+        return fallback
+
+
 def compute_metrics(cdata: dict) -> dict:
-    """Compute derived F&B metrics for all historical years."""
+    """
+    Compute derived F&B metrics for all historical years.
+    All ratio calculations use safe_div so missing data never breaks the app.
+    Includes ROIC using the effective tax rate implied by (1 - NI/EBIT).
+    """
     d, yrs = cdata["data"], cdata["years"]
 
     def g(key, yr):
-        return d.get(key, {}).get(yr, 0.0) or 0.0
+        return safe_float(d.get(key, {}).get(yr, 0.0))
 
     result = {}
     for yr in yrs:
-        rev   = g("revenue", yr) or 1
-        cogs  = abs(g("cogs",   yr))
-        labor = abs(g("labor",  yr))
-        sga   = abs(g("sga",    yr))
-        da    = abs(g("da",     yr))
-        cfo   = g("cfo",   yr)
-        capex = g("capex", yr)
-        cash  = g("cash",  yr)
-        ltd   = g("ltd",   yr)
-        ni    = g("net_income", yr)
-        adv   = abs(g("advertising", yr))
-        opex  = abs(g("store_opex",  yr))
+        rev       = g("revenue", yr)
+        cogs      = abs(g("cogs",   yr))
+        labor     = abs(g("labor",  yr))
+        sga       = abs(g("sga",    yr))
+        da        = abs(g("da",     yr))
+        cfo       = g("cfo",   yr)
+        capex     = g("capex", yr)
+        cash      = g("cash",  yr)
+        ltd       = g("ltd",   yr)
+        ni        = g("net_income", yr)
+        adv       = abs(g("advertising", yr))
+        opex      = abs(g("store_opex",  yr))
+        ta        = g("total_assets", yr)
+        equity    = g("equity", yr)
+        interest  = abs(g("interest", yr))
+
+        # Guard against completely missing revenue data
+        if rev == 0:
+            result[yr] = {k: 0.0 for k in [
+                "prime_cost_pct","cogs_pct","labor_pct","adv_pct","opex_pct",
+                "sga_pct","da_pct","ebitda","ebitda_margin","net_margin",
+                "fcf","fcf_margin","capex_pct","net_debt","cfo","roic",
+            ]}
+            continue
 
         capex_abs  = abs(capex)
         prime_cost = cogs + labor
         ebitda     = rev - cogs - labor - adv - opex - sga
+        ebit       = ebitda - da
         fcf        = cfo - capex_abs
         net_debt   = ltd - cash
 
+        # Invested capital = Total Assets - non-interest-bearing current liabilities proxy
+        # Simple proxy: Total Assets - Cash (removes excess cash from capital base)
+        invested_capital = max(0, ta - cash)
+
+        # ROIC = NOPAT / Invested Capital
+        # NOPAT = EBIT * (1 - effective_tax_rate)
+        # Derive effective tax rate from actuals; clamp to [0, 0.50]
+        tax_provision = g("tax", yr)
+        ebt           = ebit - interest
+        eff_tax       = safe_div(abs(tax_provision), max(0, ebt), fallback=0.25)
+        eff_tax       = min(max(eff_tax, 0.0), 0.50)
+        nopat         = ebit * (1 - eff_tax)
+        roic          = safe_div(nopat, invested_capital)
+
         result[yr] = {
-            "prime_cost_pct":  prime_cost / rev,
-            "cogs_pct":        cogs  / rev,
-            "labor_pct":       labor / rev,
-            "adv_pct":         adv   / rev,
-            "opex_pct":        opex  / rev,
-            "sga_pct":         sga   / rev,
-            "da_pct":          da    / rev,
-            "ebitda":          ebitda,
-            "ebitda_margin":   ebitda / rev,
-            "net_margin":      ni    / rev,
-            "fcf":             fcf,
-            "fcf_margin":      fcf   / rev,
-            "capex_pct":       capex_abs / rev,
-            "net_debt":        net_debt,
-            "cfo":             cfo,
+            "prime_cost_pct": safe_div(prime_cost, rev),
+            "cogs_pct":       safe_div(cogs,  rev),
+            "labor_pct":      safe_div(labor, rev),
+            "adv_pct":        safe_div(adv,   rev),
+            "opex_pct":       safe_div(opex,  rev),
+            "sga_pct":        safe_div(sga,   rev),
+            "da_pct":         safe_div(da,    rev),
+            "ebitda":         ebitda,
+            "ebitda_margin":  safe_div(ebitda, rev),
+            "net_margin":     safe_div(ni,    rev),
+            "fcf":            fcf,
+            "fcf_margin":     safe_div(fcf,   rev),
+            "capex_pct":      safe_div(capex_abs, rev),
+            "net_debt":       net_debt,
+            "cfo":            cfo,
+            "roic":           roic,
         }
     return result
 
@@ -890,8 +961,8 @@ def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
         tax_amt  = max(0, ebt) * tax_rate
         ni       = ebt - tax_amt
 
-        ebitda_margin = ebitda / rev if rev else 0
-        net_margin    = ni     / rev if rev else 0
+        ebitda_margin = safe_div(ebitda, rev)
+        net_margin    = safe_div(ni,     rev)
 
         # ── Cash Flow ────────────────────────────────────────────────────────
         nwc_change = rev * nwc_pct
@@ -907,13 +978,13 @@ def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
         proj_cash       = max(0, prev_cash + net_cash_change)
 
         fcf        = cfo + cfi
-        fcf_margin = fcf / rev if rev else 0
+        fcf_margin = safe_div(fcf, rev)
 
         # ── Balance Sheet ────────────────────────────────────────────────────
         proj_ppe      = max(0, prev_ppe + capex_amt - da_amt)
         proj_goodwill = prev_goodwill
 
-        rev_gr_factor  = rev / prev_rev if prev_rev else 1.0
+        rev_gr_factor  = safe_div(rev, prev_rev, fallback=1.0)
         other_a_seed   = max(0, g("total_assets") - g("cash") - g("ppe") - g("goodwill"))
         proj_total_assets = proj_cash + proj_ppe + proj_goodwill + other_a_seed * rev_gr_factor
 
@@ -927,6 +998,11 @@ def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
         proj_equity     = prev_equity + ni - equity_returned
 
         net_debt = proj_ltd - proj_cash
+
+        # ROIC for projected years: NOPAT / (Total Assets - Cash)
+        nopat        = ebit * (1 - tax_rate)
+        inv_capital  = max(0, proj_total_assets - proj_cash)
+        proj_roic    = safe_div(nopat, inv_capital)
 
         proj[yr_label] = {
             # Income Statement (expenses = positive gross amounts)
@@ -944,6 +1020,7 @@ def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
             "ebitda":         ebitda,
             "ebitda_margin":  ebitda_margin,
             "net_margin":     net_margin,
+            "roic":           proj_roic,
             # Per-year effective rates for Excel assumptions block
             "_rev_gr":    rev_gr,
             "_cogs_pct":  cogs_adj,
@@ -1154,17 +1231,27 @@ def build_cf_df(cdata: dict, metrics: dict, proj: dict) -> pd.DataFrame:
 # =============================================================================
 # DISPLAY HELPERS
 # =============================================================================
-def kpi_card(col, label: str, value: str, delta: str = "", neg: bool = False):
-    delta_class = "kpi-neg" if neg else ""
-    arrow = "▼" if neg else "▲"
-    delta_html = (f'<div class="kpi-delta {delta_class}">{arrow} {delta}</div>'
-                  if delta else "")
-    col.markdown(f"""
-    <div class="kpi-card">
-      <div class="kpi-label">{label}</div>
-      <div class="kpi-value">{value}</div>
-      {delta_html}
-    </div>""", unsafe_allow_html=True)
+def kpi_card(col, label: str, value: str, delta: str = "", neg: bool = False) -> None:
+    """
+    Render a styled KPI card inside a Streamlit column.
+    Uses unsafe_allow_html which is required for custom card styling.
+    label/value/delta are plain strings — no raw user data flows here.
+    """
+    delta_cls  = "kpi-neg" if neg else ""
+    arrow      = "▼" if neg else "▲"
+    delta_html = (
+        f'<div class="kpi-delta {delta_cls}">{arrow} {delta}</div>'
+        if delta else ""
+    )
+    col.markdown(
+        f"""
+        <div class="kpi-card">
+          <div class="kpi-label">{label}</div>
+          <div class="kpi-value">{value}</div>
+          {delta_html}
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
 
 def styled_table(df: pd.DataFrame, pct_rows: list[str] = None) -> pd.DataFrame:
@@ -2317,14 +2404,14 @@ def main():
     with tab2:
         # KPI Cards — always show latest actual (historical) year
         for ticker, cdata in active.items():
-            # latest_actual_year is the last year in cdata["years"] (historical only)
             last_actual = cdata["years"][-1]
-            m   = active_metrics[ticker].get(last_actual, {})
-            rev  = cdata["data"].get("revenue",    {}).get(last_actual, 0) or 0
-            ni   = cdata["data"].get("net_income", {}).get(last_actual, 0) or 0
-            ltd  = cdata["data"].get("ltd",        {}).get(last_actual, 0) or 0
-            cash = cdata["data"].get("cash",       {}).get(last_actual, 0) or 0
+            m    = active_metrics[ticker].get(last_actual, {})
+            rev  = safe_float(cdata["data"].get("revenue",    {}).get(last_actual, 0))
+            ni   = safe_float(cdata["data"].get("net_income", {}).get(last_actual, 0))
+            ltd  = safe_float(cdata["data"].get("ltd",        {}).get(last_actual, 0))
+            cash = safe_float(cdata["data"].get("cash",       {}).get(last_actual, 0))
             nd   = ltd - cash
+            roic = m.get("roic", 0.0)
 
             st.markdown(
                 f'<div class="section-hdr">{ticker} '
@@ -2332,11 +2419,12 @@ def main():
                 f'Latest Actual: {last_actual}</span></div>',
                 unsafe_allow_html=True,
             )
-            c1, c2, c3, c4, c5 = st.columns(5)
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
             kpi_card(c1, f"Net Revenue ({last_actual})", fmt_val(rev))
             kpi_card(c2, "EBITDA Margin",
                      f"{m.get('ebitda_margin', 0):.1%}",
-                     delta="vs industry ~15%" if m.get("ebitda_margin", 0) > 0.15 else "")
+                     delta="Above 15% threshold" if m.get("ebitda_margin", 0) > 0.15 else "Below 15%",
+                     neg=(m.get("ebitda_margin", 0) <= 0.15))
             kpi_card(c3, "Net Income",
                      fmt_val(ni),
                      delta=f"Net Margin {m.get('net_margin', 0):.1%}",
@@ -2344,6 +2432,10 @@ def main():
             kpi_card(c4, "Net Debt (LTD minus Cash)", fmt_val(nd), neg=(nd > 0))
             kpi_card(c5, "Free Cash Flow", fmt_val(m.get("fcf", 0)),
                      neg=(m.get("fcf", 0) < 0))
+            kpi_card(c6, f"ROIC ({last_actual})",
+                     f"{roic:.1%}",
+                     delta=f"Tax rate used: {tax_rate:.0%}",
+                     neg=(roic < 0.08))
 
         # Cross-company benchmarking table
         st.markdown('<div class="section-hdr">Cross-Company Benchmarking Matrix</div>',
@@ -2353,29 +2445,30 @@ def main():
         for ticker, cdata in active.items():
             last_actual = cdata["years"][-1]
             m   = active_metrics[ticker].get(last_actual, {})
-            rev = cdata["data"].get("revenue",    {}).get(last_actual, 0) or 0
-            ni  = cdata["data"].get("net_income", {}).get(last_actual, 0) or 0
-            ltd = cdata["data"].get("ltd",        {}).get(last_actual, 0) or 0
-            csh = cdata["data"].get("cash",       {}).get(last_actual, 0) or 0
+            rev = safe_float(cdata["data"].get("revenue",    {}).get(last_actual, 0))
+            ni  = safe_float(cdata["data"].get("net_income", {}).get(last_actual, 0))
+            ltd = safe_float(cdata["data"].get("ltd",        {}).get(last_actual, 0))
+            csh = safe_float(cdata["data"].get("cash",       {}).get(last_actual, 0))
             bench_rows.append({
                 "Ticker":           ticker,
                 "Latest Year":      last_actual,
-                "Net Revenue ($M)": f"${rev/1e3:.1f}M",
+                "Net Revenue ($M)": f"${rev/1e3:.1f}M"   if rev else "N/A",
                 "EBITDA Margin":    f"{m.get('ebitda_margin', 0):.1%}",
-                "Net Margin":       f"{m.get('net_margin', 0):.1%}",
-                "Net Income ($M)":  f"${ni/1e3:.1f}M",
+                "Net Margin":       f"{m.get('net_margin',    0):.1%}",
+                "Net Income ($M)":  f"${ni/1e3:.1f}M"    if rev else "N/A",
+                "ROIC":             f"{m.get('roic', 0):.1%}",
                 "FCF ($M)":         f"${m.get('fcf', 0)/1e3:.1f}M",
                 "FCF Margin":       f"{m.get('fcf_margin', 0):.1%}",
-                "Prime Cost Pct":   f"{m.get('prime_cost_pct', 0):.1%}",
+                "Prime Cost %":     f"{m.get('prime_cost_pct', 0):.1%}",
                 "Net Debt ($M)":    f"${(ltd - csh)/1e3:.1f}M",
-                "CapEx Pct Rev":    f"{m.get('capex_pct', 0):.1%}",
+                "CapEx % Rev":      f"{m.get('capex_pct', 0):.1%}",
             })
 
         bench_df = pd.DataFrame(bench_rows)
         st.dataframe(bench_df, hide_index=True, use_container_width=True,
                      height=min(200, 60 + 35 * len(bench_rows)))
 
-        # Projection summary — includes Net Margin and CFF
+        # Projection summary
         st.markdown(
             f'<div class="section-hdr">'
             f'{proj_labels[0]} to {proj_labels[-1]} Projection Summary</div>',
@@ -2385,29 +2478,27 @@ def main():
         proj_rows = []
         for ticker in active:
             for yr, pdata in active_proj[ticker].items():
-                rev_p   = pdata.get("revenue",    1) or 1
-                ebitda_p = pdata.get("ebitda",    0)
-                ni_p    = pdata.get("net_income", 0)
-                fcf_p   = pdata.get("fcf",        0)
-                cfo_p   = pdata.get("cfo",        0)
-                # Always recompute ratios from raw values so they are clearly dynamic
-                em_p  = ebitda_p / rev_p
-                nm_p  = ni_p     / rev_p
-                fcfm_p = fcf_p   / rev_p
+                rev_p    = safe_float(pdata.get("revenue",    0)) or 1
+                ebitda_p = safe_float(pdata.get("ebitda",     0))
+                ni_p     = safe_float(pdata.get("net_income", 0))
+                fcf_p    = safe_float(pdata.get("fcf",        0))
+                cfo_p    = safe_float(pdata.get("cfo",        0))
+                roic_p   = safe_float(pdata.get("roic",       0))
                 proj_rows.append({
-                    "Ticker":            ticker,
-                    "Year":              yr,
-                    "Revenue ($M)":      f"${rev_p/1e3:.1f}M",
-                    "EBITDA ($M)":       f"${ebitda_p/1e3:.1f}M",
-                    "EBITDA Margin":     f"{em_p:.1%}",
-                    "Net Income ($M)":   f"${ni_p/1e3:.1f}M",
-                    "Net Margin":        f"{nm_p:.1%}",
-                    "FCF ($M)":          f"${fcf_p/1e3:.1f}M",
-                    "FCF Margin":        f"{fcfm_p:.1%}",
-                    "CFO ($M)":          f"${cfo_p/1e3:.1f}M",
-                    "CFF ($M)":          f"${pdata.get('cff', 0)/1e3:.1f}M",
-                    "Cash ($M)":         f"${pdata.get('bs_cash', 0)/1e3:.1f}M",
-                    "Net Debt ($M)":     f"${pdata.get('net_debt', 0)/1e3:.1f}M",
+                    "Ticker":          ticker,
+                    "Year":            yr,
+                    "Revenue ($M)":    f"${rev_p/1e3:.1f}M",
+                    "EBITDA ($M)":     f"${ebitda_p/1e3:.1f}M",
+                    "EBITDA Margin":   f"{safe_div(ebitda_p, rev_p):.1%}",
+                    "Net Income ($M)": f"${ni_p/1e3:.1f}M",
+                    "Net Margin":      f"{safe_div(ni_p, rev_p):.1%}",
+                    "ROIC (proj)":     f"{roic_p:.1%}",
+                    "FCF ($M)":        f"${fcf_p/1e3:.1f}M",
+                    "FCF Margin":      f"{safe_div(fcf_p, rev_p):.1%}",
+                    "CFO ($M)":        f"${cfo_p/1e3:.1f}M",
+                    "CFF ($M)":        f"${safe_float(pdata.get('cff', 0))/1e3:.1f}M",
+                    "Cash ($M)":       f"${safe_float(pdata.get('bs_cash', 0))/1e3:.1f}M",
+                    "Net Debt ($M)":   f"${safe_float(pdata.get('net_debt', 0))/1e3:.1f}M",
                 })
         proj_df = pd.DataFrame(proj_rows)
         st.dataframe(proj_df, hide_index=True, use_container_width=True,
@@ -2473,12 +2564,13 @@ def main():
         m = cmets.get(last_yr, {})
 
         kpi_data = [
-            ("Prime Cost Pct",      f"{m.get('prime_cost_pct',0):.1%}"),
-            ("EBITDA Margin",       f"{m.get('ebitda_margin',0):.1%}"),
-            ("Net Margin",          f"{m.get('net_margin',0):.1%}"),
-            ("FCF Margin",          f"{m.get('fcf_margin',0):.1%}"),
-            ("CapEx Pct Revenue",   f"{m.get('capex_pct',0):.1%}"),
-            ("Net Debt ($000s)",    fmt_val(m.get("net_debt",0))),
+            ("Prime Cost %",       f"{m.get('prime_cost_pct', 0):.1%}"),
+            ("EBITDA Margin",      f"{m.get('ebitda_margin',  0):.1%}"),
+            ("Net Margin",         f"{m.get('net_margin',     0):.1%}"),
+            ("ROIC",               f"{m.get('roic',           0):.1%}"),
+            ("FCF Margin",         f"{m.get('fcf_margin',     0):.1%}"),
+            ("CapEx % Revenue",    f"{m.get('capex_pct',      0):.1%}"),
+            ("Net Debt ($000s)",   fmt_val(m.get("net_debt",  0))),
         ]
         kpi_cols = st.columns(len(kpi_data))
         for col, (lbl, val) in zip(kpi_cols, kpi_data):
