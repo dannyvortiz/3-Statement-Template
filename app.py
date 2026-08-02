@@ -84,74 +84,223 @@ st.markdown("""
 # Add entries here to support additional naming conventions
 # =============================================================================
 LINE_MAP: dict[str, str] = {
-    # Revenue
-    "total revenue": "revenue", "total revenues": "revenue",
-    "net revenue": "revenue",   "net revenues": "revenue",
-    "revenue": "revenue",       "net sales": "revenue",
-    "total net revenues": "revenue",
+    # ── Revenue ───────────────────────────────────────────────────────────────
+    "total revenue": "revenue",            "total revenues": "revenue",
+    "net revenue": "revenue",              "net revenues": "revenue",
+    "revenue": "revenue",                  "net sales": "revenue",
+    "total net revenues": "revenue",       "total net revenue": "revenue",
+    "restaurant revenue": "revenue",       "restaurant sales": "revenue",
+    "company restaurant sales": "revenue", "shack sales": "revenue",
 
-    # COGS
-    "cost of sales": "cogs",          "cost of goods sold": "cogs",
-    "cost of revenue": "cogs",         "restaurant operating costs": "cogs",
+    # ── COGS / Food costs ─────────────────────────────────────────────────────
+    "cost of sales": "cogs",
+    "cost of goods sold": "cogs",
+    "cost of revenue": "cogs",
+    "restaurant operating costs": "cogs",
     "company-operated shop costs": "cogs",
-    "food beverage packaging": "cogs", "food and paper costs": "cogs",
+    "food beverage packaging": "cogs",
+    "food and paper costs": "cogs",
+    "food beverage and packaging": "cogs",  # Chipotle / Sweetgreen exact label
+    "food  beverage and packaging": "cogs", # trailing-space variant
+    "food and beverage costs": "cogs",
+    "food costs": "cogs",
+    "cost of food and paper": "cogs",
+    "product costs": "cogs",
 
-    # Labor
-    "labor": "labor",                  "labor expense": "labor",
-    "labor and related costs": "labor","labor costs": "labor",
+    # ── Labor ─────────────────────────────────────────────────────────────────
+    "labor": "labor",
+    "labor expense": "labor",
+    "labor and related costs": "labor",
+    "labor costs": "labor",
     "store labor": "labor",
+    "labor and related expenses": "labor",  # Shake Shack / Sweetgreen exact
+    "restaurant labor": "labor",
+    "crew labor": "labor",
 
-    # Store operating expenses
+    # ── Store / restaurant operating expenses ─────────────────────────────────
     "store operating expenses": "store_opex",
     "restaurant operating expenses": "store_opex",
     "occupancy and other costs": "store_opex",
+    "occupancy costs": "store_opex",        # Chipotle exact
+    "occupancy and related expenses": "store_opex",  # Shake Shack / Sweetgreen
+    "other operating costs": "store_opex",  # Chipotle exact
+    "other restaurant operating costs": "store_opex",  # Sweetgreen exact
+    "other operating expenses": "store_opex",
+    "pre-opening costs": "store_opex",
+    "pre opening costs": "store_opex",      # normalized variant (no hyphen)
+    "restaurant pre-opening costs": "store_opex",
+    "preopening costs": "store_opex",
 
-    # Advertising
-    "advertising expenses": "advertising", "advertising fees": "advertising",
-    "advertising expense": "advertising",  "marketing expense": "advertising",
+    # ── Advertising / marketing ───────────────────────────────────────────────
+    "advertising expenses": "advertising",
+    "advertising fees": "advertising",
+    "advertising expense": "advertising",
+    "marketing expense": "advertising",
+    "marketing expenses": "advertising",
 
-    # SGA
+    # ── SGA ───────────────────────────────────────────────────────────────────
     "selling general and administrative": "sga",
-    "sg&a": "sga", "sga": "sga",
-    "general and administrative": "sga", "g&a": "sga",
+    "sg&a": "sga",
+    "sga": "sga",
+    "general and administrative": "sga",
+    "g&a": "sga",
+    "general and administrative expenses": "sga",   # all three companies exact
+    "general and administrative expense": "sga",
+    "corporate general and administrative": "sga",
 
-    # DA
+    # ── D&A ───────────────────────────────────────────────────────────────────
     "depreciation and amortization": "da",
-    "d&a": "da", "depreciation": "da", "amortization": "da",
+    "d&a": "da",
+    "depreciation": "da",
+    "amortization": "da",
+    "depreciation and amortization expense": "da",
 
-    # Interest
-    "interest expense": "interest",    "interest expense net": "interest",
-    "net interest expense": "interest","interest expense income net": "interest",
+    # ── Stock-based compensation (maps to a new key for CF add-back) ──────────
+    "stock-based compensation": "sbc",
+    "stock based compensation": "sbc",
+    "share-based compensation": "sbc",
+    "share based compensation expense": "sbc",
 
-    # Tax
-    "income tax expense": "tax",       "income tax": "tax",
-    "provision for income taxes": "tax","benefit from income taxes": "tax",
+    # ── EBIT / Operating income ───────────────────────────────────────────────
+    "operating income": "ebit",
+    "operating income loss": "ebit",        # Shake Shack / Sweetgreen exact
+    "income from operations": "ebit",
+    "loss from operations": "ebit",
+    "operating profit": "ebit",
+    "income loss from operations": "ebit",
 
-    # Net income
-    "net income": "net_income",        "net income loss": "net_income",
+    # ── Interest ─────────────────────────────────────────────────────────────
+    "interest expense": "interest",
+    "interest expense net": "interest",
+    "net interest expense": "interest",
+    "interest expense income net": "interest",
+    "interest income": "interest",
+    "interest income expense net": "interest",
+
+    # ── Tax ───────────────────────────────────────────────────────────────────
+    "income tax expense": "tax",
+    "income tax": "tax",
+    "provision for income taxes": "tax",
+    "benefit from income taxes": "tax",
+    "income tax expense benefit": "tax",
+    "income tax provision": "tax",
+
+    # ── Net income ────────────────────────────────────────────────────────────
+    "net income": "net_income",
+    "net income loss": "net_income",
     "net loss": "net_income",
+    "net income attributable": "net_income",
+    "net loss attributable": "net_income",
 
-    # Balance sheet
-    "cash and cash equivalents": "cash","cash": "cash",
-    "property and equipment net": "ppe","pp&e net": "ppe",
+    # ── Balance sheet: current assets ─────────────────────────────────────────
+    "cash and cash equivalents": "cash",
+    "cash": "cash",
+    "total current assets": "current_assets",
+    "accounts receivable": "accounts_receivable",
+    "inventories": "inventories",
+    "inventory": "inventories",
+    "prepaid expenses and other current assets": "prepaid_other",
+    "prepaid expenses": "prepaid_other",
+    "marketable securities": "marketable_securities",   # Shake Shack
+    "short-term investments": "short_term_investments", # Sweetgreen
+    "short term investments": "short_term_investments",
+
+    # ── Balance sheet: long-term assets ──────────────────────────────────────
+    "property and equipment net": "ppe",
+    "pp&e net": "ppe",
     "property plant and equipment net": "ppe",
-    "goodwill": "goodwill",            "goodwill and intangibles": "goodwill",
+    "property and equipment  net": "ppe",   # double-space variant
+    "operating lease right-of-use assets": "rou_assets",
+    "operating lease right of use assets": "rou_assets",
+    "right-of-use assets": "rou_assets",
+    "right of use assets net": "rou_assets",
+    "goodwill": "goodwill",
+    "goodwill and intangibles": "goodwill",
+    "intangible assets and goodwill": "goodwill",      # Shake Shack exact
+    "intangible assets net": "goodwill",
+    "other non-current assets": "other_nca",
+    "other noncurrent assets": "other_nca",
+    "other non current assets": "other_nca",           # all three exact (normalized)
     "total assets": "total_assets",
-    "long-term debt": "ltd",           "long term debt": "ltd",
-    "total debt": "ltd",               "notes payable": "ltd",
-    "total liabilities": "total_liabilities",
-    "total equity": "equity",          "total stockholders equity": "equity",
-    "stockholders equity": "equity",   "shareholders equity": "equity",
-    "total stockholders deficit": "equity",
 
-    # Cash flow
+    # ── Balance sheet: current liabilities ───────────────────────────────────
+    "accounts payable": "accounts_payable",
+    "accrued liabilities": "accrued_liabilities",
+    "accrued expenses": "accrued_liabilities",          # Shake Shack exact
+    "current operating lease liabilities": "cur_lease_lia",
+    "current portion of operating lease liabilities": "cur_lease_lia",
+    "total current liabilities": "current_liabilities",
+
+    # ── Balance sheet: long-term liabilities ──────────────────────────────────
+    "long-term debt": "ltd",
+    "long term debt": "ltd",
+    "total debt": "ltd",
+    "notes payable": "ltd",
+    "non-current operating lease liabilities": "lt_lease_lia",
+    "noncurrent operating lease liabilities": "lt_lease_lia",
+    "long-term operating lease liabilities": "lt_lease_lia",
+    "other non-current liabilities": "other_ncl",
+    "other noncurrent liabilities": "other_ncl",
+    "other non current liabilities": "other_ncl",
+
+    # ── Balance sheet: equity ─────────────────────────────────────────────────
+    "total liabilities": "total_liabilities",
+    "total equity": "equity",
+    "total stockholders equity": "equity",
+    "stockholders equity": "equity",
+    "shareholders equity": "equity",
+    "total stockholders deficit": "equity",
+    "total liabilities and equity": "total_liab_equity",   # cross-check row
+    "total liabilities and stockholders equity": "total_liab_equity",
+    "retained earnings": "retained_earnings",
+    "retained earnings accum deficit": "retained_earnings",  # Shake Shack exact
+    "accumulated deficit": "retained_earnings",               # Sweetgreen exact
+    "common stock and treasury stock": "common_stock",        # Chipotle exact
+    "common stock and additional paid in capital": "common_stock", # SHAK/SG exact
+    "common stock": "common_stock",
+
+    # ── Cash flow: operating ──────────────────────────────────────────────────
     "cash provided by operating activities": "cfo",
     "net cash provided by operating": "cfo",
+    "net cash provided by operating activities": "cfo",
     "operating cash flow": "cfo",
+    "cash flows from operating activities": "cfo",
+    "net cash from operating activities": "cfo",
+    "changes in operating working capital": "working_capital_change",
+    "change in operating working capital": "working_capital_change",
+    "changes in working capital": "working_capital_change",
+
+    # ── Cash flow: investing ──────────────────────────────────────────────────
     "purchases of property and equipment": "capex",
-    "capital expenditures": "capex",   "capex": "capex",
-    "net cash used in financing": "cff","cash used in financing": "cff",
+    "capital expenditures": "capex",
+    "capex": "capex",
+    "additions to property and equipment": "capex",
+    "purchase of property and equipment": "capex",
+    "cash used in investing activities": "cfi",             # all three exact
+    "net cash used in investing activities": "cfi",
+    "net cash from investing activities": "cfi",
+    "other investing activities": "other_investing",
+    "other investing activities net": "other_investing",
+
+    # ── Cash flow: financing ──────────────────────────────────────────────────
+    "net cash used in financing": "cff",
+    "cash used in financing": "cff",
     "cash flow from financing": "cff",
+    "cash used in financing activities": "cff",             # all three exact
+    "net cash used in financing activities": "cff",
+    "net cash from financing activities": "cff",
+    "repurchase of common stock": "share_repurchase",       # Chipotle exact
+    "repurchases of common stock": "share_repurchase",
+    "other financing activities": "other_financing",
+    "proceeds from stock option exercises": "stock_proceeds",  # Shake Shack exact
+    "proceeds from stock issuance": "stock_proceeds",          # Sweetgreen exact
+    "proceeds from exercise of stock options": "stock_proceeds",
+
+    # ── Cash flow: other ──────────────────────────────────────────────────────
+    "net increase in cash": "net_cash_change",
+    "net increase decrease in cash": "net_cash_change",
+    "net decrease in cash": "net_cash_change",
+    "net change in cash": "net_cash_change",
 }
 
 DISPLAY_NAMES: dict[str, str] = {
@@ -186,12 +335,191 @@ CF_KEYS  = ["cfo","capex","cff"]
 # DATA PARSING ENGINE
 # =============================================================================
 def normalize_label(raw: str) -> str | None:
+    """
+    Convert a raw SEC filing line-item label to a canonical key.
+
+    Resolution order:
+      1. Exact match after standard cleaning (lowercase, strip punctuation).
+      2. Fuzzy substring rules — applied in priority order so that more
+         specific patterns are tested before broader ones.  A rule fires
+         when ALL required tokens appear in the cleaned string AND none of
+         the optional exclusion tokens appear.
+
+    Returns the canonical key string, or None if nothing matches.
+    The caller (unmapped list) handles the None case.
+    """
+    # ── Stage 1: exact dictionary lookup ──────────────────────────────────────
     cleaned = (str(raw).strip().lower()
-               .replace(",","").replace(".","")
-               .replace("(","").replace(")","")
-               .replace("-"," ").replace("/"," ")
-               .replace("  "," "))
-    return LINE_MAP.get(cleaned)
+               .replace(",", "").replace(".", "")
+               .replace("(", "").replace(")", "")
+               .replace("-", " ").replace("/", " ")
+               .replace("  ", " ").strip())
+
+    if cleaned in LINE_MAP:
+        return LINE_MAP[cleaned]
+
+    # ── Stage 2: fuzzy substring rules ────────────────────────────────────────
+    # Each entry: (required_tokens, exclude_tokens, canonical_key)
+    # ALL required tokens must appear; ANY exclude token disqualifies the match.
+    # Listed from most specific to least specific so earlier rules win.
+    FUZZY_RULES: list[tuple[list[str], list[str], str]] = [
+        # Revenue — must contain "revenue" or "sales" but not be a sub-line
+        (["total net revenue"],   [],                          "revenue"),
+        (["total net revenues"],  [],                          "revenue"),
+        (["total revenue"],       ["cost", "other"],           "revenue"),
+        (["net revenue"],         ["cost", "other"],           "revenue"),
+        (["net revenues"],        ["cost", "other"],           "revenue"),
+        (["restaurant revenue"],  [],                          "revenue"),
+        (["shack sales"],         [],                          "revenue"),
+        (["company restaurant"],  ["cost"],                    "revenue"),
+
+        # Food / COGS — food + beverage + packaging cluster
+        (["food", "beverage", "packaging"], [],                "cogs"),
+        (["food", "packaging"],             [],                "cogs"),
+        (["food", "beverage"],              ["labor","sga","admin"], "cogs"),
+        (["food", "paper"],                 [],                "cogs"),
+        (["cost of sales"],                 [],                "cogs"),
+        (["cost of goods"],                 [],                "cogs"),
+        (["cost of revenue"],               [],                "cogs"),
+
+        # Labor
+        (["labor", "related"],              [],                "labor"),
+        (["labor", "expense"],              [],                "labor"),
+        (["labor", "cost"],                 [],                "labor"),
+
+        # Store operating / occupancy
+        (["pre", "opening"],                [],                "store_opex"),
+        (["pre-opening"],                   [],                "store_opex"),
+        (["occupancy", "related"],          [],                "store_opex"),
+        (["occupancy"],                     [],                "store_opex"),
+        (["other restaurant operating"],    [],                "store_opex"),
+        (["other operating"],               ["income","expense","non"],  "store_opex"),
+
+        # SGA — general and administrative
+        (["general", "administrative"],     [],                "sga"),
+
+        # D&A
+        (["depreciation", "amortization"],  [],                "da"),
+        (["depreciation"],                  ["accumulated"],   "da"),
+
+        # Stock-based compensation
+        (["stock", "compensation"],         [],                "sbc"),
+        (["share", "compensation"],         [],                "sbc"),
+        (["stock-based"],                   [],                "sbc"),
+
+        # EBIT / operating income
+        (["operating income"],              ["non"],           "ebit"),
+        (["income from operations"],        [],                "ebit"),
+        (["loss from operations"],          [],                "ebit"),
+        (["operating profit"],              [],                "ebit"),
+
+        # Interest
+        (["interest expense"],              [],                "interest"),
+        (["net interest"],                  [],                "interest"),
+
+        # Tax
+        (["income tax"],                    [],                "tax"),
+        (["provision for income"],          [],                "tax"),
+        (["benefit from income tax"],       [],                "tax"),
+
+        # Net income
+        (["net income"],                    [],                "net_income"),
+        (["net loss"],                      [],                "net_income"),
+
+        # ── Balance sheet assets ──────────────────────────────────────────────
+        (["total current assets"],          [],                "current_assets"),
+        (["cash", "cash equivalents"],      [],                "cash"),
+        (["accounts receivable"],           [],                "accounts_receivable"),
+        (["inventories"],                   [],                "inventories"),
+        (["inventory"],                     [],                "inventories"),
+        (["prepaid"],                       [],                "prepaid_other"),
+        (["marketable securities"],         [],                "marketable_securities"),
+        (["short", "term", "investment"],   [],                "short_term_investments"),
+        (["right-of-use"],                  ["current"],       "rou_assets"),
+        (["right of use"],                  ["current"],       "rou_assets"),
+        (["operating lease", "asset"],      ["current"],       "rou_assets"),
+        (["intangible", "goodwill"],        [],                "goodwill"),
+        (["goodwill"],                      [],                "goodwill"),
+        (["property", "equipment", "net"],  [],                "ppe"),
+        (["property", "plant", "equipment"],["purchases"],     "ppe"),
+        (["other non-current assets"],      [],                "other_nca"),
+        (["other noncurrent assets"],       [],                "other_nca"),
+        (["other non current assets"],      [],                "other_nca"),
+        (["total assets"],                  ["current","liab"],"total_assets"),
+
+        # ── Balance sheet liabilities ─────────────────────────────────────────
+        (["accounts payable"],              [],                "accounts_payable"),
+        (["accrued liabilities"],           [],                "accrued_liabilities"),
+        (["accrued expenses"],              [],                "accrued_liabilities"),
+        (["current", "operating lease", "liabilit"], ["non"],  "cur_lease_lia"),
+        (["total current liabilities"],     [],                "current_liabilities"),
+        (["non-current", "operating lease"],["asset"],         "lt_lease_lia"),
+        (["noncurrent", "operating lease"], ["asset"],         "lt_lease_lia"),
+        (["long-term", "operating lease"],  ["asset"],         "lt_lease_lia"),
+        (["non current", "operating lease"],["asset"],         "lt_lease_lia"),
+        (["non current", "lease", "liabilit"], ["asset"],      "lt_lease_lia"),
+        (["other non-current liabilities"], [],                "other_ncl"),
+        (["other noncurrent liabilities"],  [],                "other_ncl"),
+        (["other non current liabilities"], [],                "other_ncl"),
+        (["long-term debt"],                [],                "ltd"),
+        (["long term debt"],                [],                "ltd"),
+        (["total liabilities"],             ["equity","and"],  "total_liabilities"),
+
+        # ── Balance sheet equity ──────────────────────────────────────────────
+        (["total liabilities", "equity"],   [],                "total_liab_equity"),
+        (["total liabilities and"],         [],                "total_liab_equity"),
+        (["retained earnings"],             [],                "retained_earnings"),
+        (["accumulated deficit"],           [],                "retained_earnings"),
+        (["common stock", "additional"],    [],                "common_stock"),
+        (["common stock", "treasury"],      [],                "common_stock"),
+        (["total equity"],                  [],                "equity"),
+        (["total stockholders"],            [],                "equity"),
+        (["stockholders equity"],           [],                "equity"),
+        (["shareholders equity"],           [],                "equity"),
+
+        # ── Cash flow: operating ──────────────────────────────────────────────
+        (["net cash", "operating"],         [],                "cfo"),
+        (["cash", "operating activities"],  ["used"],          "cfo"),
+        (["changes in", "working capital"], [],                "working_capital_change"),
+        (["change in", "working capital"],  [],                "working_capital_change"),
+
+        # ── Cash flow: investing ──────────────────────────────────────────────
+        (["purchases of property"],         [],                "capex"),
+        (["purchase of property"],          [],                "capex"),
+        (["additions to property"],         [],                "capex"),
+        (["capital expenditures"],          [],                "capex"),
+        (["cash used in investing"],        [],                "cfi"),
+        (["net cash used in investing"],    [],                "cfi"),
+        (["net cash", "investing"],         [],                "cfi"),
+        (["other investing"],               [],                "other_investing"),
+
+        # ── Cash flow: financing ──────────────────────────────────────────────
+        (["cash used in financing"],        [],                "cff"),
+        (["net cash used in financing"],    [],                "cff"),
+        (["net cash", "financing"],         [],                "cff"),
+        (["repurchase", "common stock"],    [],                "share_repurchase"),
+        (["repurchases", "stock"],          [],                "share_repurchase"),
+        (["proceeds from stock"],           [],                "stock_proceeds"),
+        (["proceeds from exercise"],        [],                "stock_proceeds"),
+        (["other financing"],               [],                "other_financing"),
+
+        # ── Net cash change ───────────────────────────────────────────────────
+        (["net increase", "cash"],          [],                "net_cash_change"),
+        (["net decrease", "cash"],          [],                "net_cash_change"),
+        (["net increase decrease", "cash"], [],                "net_cash_change"),
+        (["net change in cash"],            [],                "net_cash_change"),
+    ]
+
+    for required_tokens, exclude_tokens, key in FUZZY_RULES:
+        # All required tokens must appear in cleaned string
+        if not all(tok in cleaned for tok in required_tokens):
+            continue
+        # No exclude token may appear
+        if any(tok in cleaned for tok in exclude_tokens):
+            continue
+        return key
+
+    return None
 
 
 def _parse_one_sheet(df: pd.DataFrame, scale: float) -> dict:
