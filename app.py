@@ -734,18 +734,21 @@ def compute_metrics(cdata: dict) -> dict:
         cash  = g("cash",  yr)
         ltd   = g("ltd",   yr)
         ni    = g("net_income", yr)
+        adv   = abs(g("advertising", yr))
+        opex  = abs(g("store_opex",  yr))
 
         capex_abs  = abs(capex)
         prime_cost = cogs + labor
-        adv        = abs(g("advertising", yr))
-        ebitda     = rev - cogs - labor - adv - abs(g("store_opex", yr)) - sga
+        ebitda     = rev - cogs - labor - adv - opex - sga
         fcf        = cfo - capex_abs
-        net_debt   = ltd - cash          # strict definition: LTD minus Cash
+        net_debt   = ltd - cash
 
         result[yr] = {
             "prime_cost_pct":  prime_cost / rev,
             "cogs_pct":        cogs  / rev,
             "labor_pct":       labor / rev,
+            "adv_pct":         adv   / rev,
+            "opex_pct":        opex  / rev,
             "sga_pct":         sga   / rev,
             "da_pct":          da    / rev,
             "ebitda":          ebitda,
@@ -760,8 +763,8 @@ def compute_metrics(cdata: dict) -> dict:
     return result
 
 
-def _hist_pct(cdata: dict, key: str, fallback: float) -> float:
-    """3-year average of |line_item| / revenue. Falls back to fallback."""
+def _hist_avg(cdata: dict, key: str, fallback: float) -> float:
+    """3-year average of |line_item| / revenue from historical data."""
     d, yrs = cdata["data"], cdata["years"]
     vals = []
     for yr in yrs[-3:]:
@@ -772,34 +775,42 @@ def _hist_pct(cdata: dict, key: str, fallback: float) -> float:
     return sum(vals) / len(vals) if vals else fallback
 
 
-def _hist_growth(cdata: dict) -> float:
-    """Average YoY revenue growth over the last 2 historical periods, capped at 25%%."""
-    d, yrs = cdata["data"], cdata["years"]
-    rates = []
-    for i in range(1, min(len(yrs), 3)):
-        r0 = d.get("revenue", {}).get(yrs[i-1], 0) or 0
-        r1 = d.get("revenue", {}).get(yrs[i],   0) or 0
-        if r0 > 0:
-            rates.append((r1 - r0) / r0)
-    avg = sum(rates) / len(rates) if rates else 0.08
-    return min(max(avg, 0.02), 0.25)
-
-
 def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
     """
-    Build projections with:
-      * Historically-anchored drivers (70% hist avg + 30% slider) to prevent
-        boundary jumps at the last actual / first estimate transition.
-      * Cash sweep: surplus cash above a target balance is returned via CFF
-        (modeled as buybacks or debt paydown) so cash does not pile up
-        unrealistically year over year.
-      * Balanced balance sheet each period.
-      * Consistent positive-sign convention for expense line items.
+    Build 3-year projections from sidebar driver sliders.
 
-    SIGN CONVENTION:
-      Revenue, EBITDA, Net Income         -> positive
-      Gross expense amounts (COGS, etc.)  -> positive gross amounts
-      CFI / CapEx outflow                 -> negative (standard cash-flow sign)
+    DESIGN PRINCIPLES
+    ─────────────────
+    1. Sliders are the single source of truth.
+       No blending with historical averages. What the user sets is what the
+       model uses. Historical averages are shown to the user as context
+       (in the sidebar captions) but never silently override the sliders.
+
+    2. Margins are dynamic, not static.
+       The slider sets a TARGET margin for Year 1 of the projection.
+       Each subsequent year, the model applies a small operating leverage
+       improvement (default +50bps EBITDA margin per year) so that Year 2
+       and Year 3 show expanding margins as the business scales. The user
+       can feel this changing by moving sliders.
+
+    3. Cost lines that have no slider (advertising, store operating costs)
+       are held at their historical average % of revenue so they don't
+       disappear from the model.
+
+    4. Cash is managed with a sweep rule: surplus above a 4-week operating
+       cash target is returned via CFF (buybacks / debt paydown), preventing
+       unrealistic compounding cash balances.
+
+    5. Balance sheet balances every period through explicit roll-forward:
+       Cash = prior + CFO + CFI + CFF
+       PP&E = prior + CapEx additions - D&A depreciation
+       Equity = prior + Net Income - any equity returned
+
+    SIGN CONVENTION
+    ───────────────
+    Revenue, EBITDA, Net Income      → positive
+    Expense amounts (COGS, SGA etc.) → positive gross amounts
+    CFI / CapEx outflow              → negative
     """
     d, yrs = cdata["data"], cdata["years"]
     last_yr = yrs[-1]
@@ -807,29 +818,40 @@ def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
     def g(key):
         return d.get(key, {}).get(last_yr, 0.0) or 0.0
 
-    def blend(hist_key: str, slider: float, fb: float) -> float:
-        hp = _hist_pct(cdata, hist_key, fb)
-        return 0.70 * hp + 0.30 * slider
-
-    # Revenue growth: blend historical rate with slider; cap at 25%
-    hist_gr   = _hist_growth(cdata)
-    rev_gr    = min(0.70 * hist_gr + 0.30 * drivers["rev_gr"], 0.25)
-
-    cogs_pct  = blend("cogs",     drivers["cogs_pct"],           0.32)
-    labor_pct = blend("labor",    drivers.get("labor_pct", 0.0), 0.00)
-    sga_pct   = blend("sga",      drivers["sga_pct"],            0.14)
-    da_pct    = blend("da",       drivers.get("da_pct", 0.04),   0.04)
-    int_pct   = blend("interest", drivers.get("int_pct", 0.03),  0.03)
-    capex_pct = blend("capex",    drivers["capex_pct"],          0.08)
+    # ── Revenue growth and non-cost drivers (exact from sliders) ────────────
+    rev_gr    = drivers["rev_gr"]
+    da_pct    = drivers.get("da_pct", 0.04)
+    int_pct   = drivers.get("int_pct", 0.03)
+    capex_pct = drivers["capex_pct"]
     tax_rate  = drivers["tax_rate"]
-    nwc_pct   = max(0.005, min(drivers.get("nwc_pct", 0.01), 0.03))
+    nwc_pct   = 0.01
 
-    # Cash target: hold ~8% of revenue (roughly 4 weeks) as operating cash.
-    # Any surplus above this is swept via CFF to prevent unrealistic pile-up.
+    # ── Cost-line targets: Y1 = 50/50 blend of historical + slider target ────
+    # This prevents boundary discontinuities: a company running 29% COGS doesn't
+    # teleport to 32% COGS in Year 1 just because the slider is at 32%.
+    # The user's slider still sets the direction and endpoint; the blend smooths
+    # the path from the company's actual last-year cost structure.
+    # Years 2-3 converge further toward the slider target via operating leverage.
+    def target(hist_key, slider_val, fb):
+        ha = _hist_avg(cdata, hist_key, fb)
+        return 0.50 * ha + 0.50 * slider_val
+
+    cogs_y1   = target("cogs",  drivers["cogs_pct"],           0.32)
+    labor_y1  = target("labor", drivers.get("labor_pct", 0.0), 0.00)
+    sga_y1    = target("sga",   drivers["sga_pct"],            0.14)
+
+    # Advertising and store_opex have no slider → always at historical average
+    adv_pct  = _hist_avg(cdata, "advertising", 0.0)
+    opex_pct = _hist_avg(cdata, "store_opex",  0.0)
+
+    # ── Operating leverage: 50bps EBITDA improvement per year ────────────────
+    # Modeled as 25bps COGS reduction + 15bps SGA reduction each year.
+    # Represents fixed-cost dilution as revenue scales.
+    MARGIN_EXPANSION_PER_YR = 0.005
+
+    # ── Seed balance sheet from last actual ──────────────────────────────────
     last_rev  = g("revenue")
     last_cash = g("cash")
-    cash_target = max(last_cash * 0.50, last_rev * 0.08)   # floor at 50% of last actual
-
     prev_cash     = last_cash
     prev_ppe      = g("ppe")
     prev_goodwill = g("goodwill")
@@ -838,100 +860,121 @@ def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
     prev_tl       = g("total_liabilities")
     prev_rev      = last_rev
 
+    # Cash target: 4 weeks of revenue as minimum operating cash
+    cash_target = max(last_cash * 0.40, last_rev * 0.08)
+
     proj: dict[str, dict] = {}
 
-    for yr_label in proj_labels:
-        # Income Statement
-        rev      = prev_rev * (1 + rev_gr)
-        cogs_amt = rev * cogs_pct
-        labor_amt= rev * labor_pct
-        sga_amt  = rev * sga_pct
-        da_amt   = rev * da_pct
-        int_amt  = rev * int_pct
+    for yr_idx, yr_label in enumerate(proj_labels):
+        # ── Income Statement ─────────────────────────────────────────────────
+        rev = prev_rev * (1 + rev_gr)
 
-        # Include advertising and store_opex at their historical average % of revenue
-        # so EBITDA reflects all operating costs, not just the main slider drivers
-        adv_pct    = _hist_pct(cdata, "advertising", 0.0)
-        opex_pct   = _hist_pct(cdata, "store_opex",  0.0)
-        adv_amt    = rev * adv_pct
-        opex_amt   = rev * opex_pct
+        # Operating leverage: Year 1 uses blended rates; Years 2-3 improve
+        leverage  = MARGIN_EXPANSION_PER_YR * yr_idx   # 0bp Y1, 50bp Y2, 100bp Y3
+        cogs_adj  = max(0.05, cogs_y1  - leverage * 0.50)   # 25bp/yr COGS improvement
+        sga_adj   = max(0.02, sga_y1   - leverage * 0.30)   # 15bp/yr SGA improvement
+        labor_adj = labor_y1                                  # labor held flat
+        da_adj    = da_pct
 
-        ebitda = rev - cogs_amt - labor_amt - sga_amt - adv_amt - opex_amt
+        cogs_amt  = rev * cogs_adj
+        labor_amt = rev * labor_adj
+        sga_amt   = rev * sga_adj
+        adv_amt   = rev * adv_pct
+        opex_amt  = rev * opex_pct
+        da_amt    = rev * da_adj
+        int_amt   = rev * int_pct
+
+        ebitda   = rev - cogs_amt - labor_amt - adv_amt - opex_amt - sga_amt
         ebit     = ebitda - da_amt
-        ebt      = ebit - int_amt
+        ebt      = ebit   - int_amt
         tax_amt  = max(0, ebt) * tax_rate
         ni       = ebt - tax_amt
 
         ebitda_margin = ebitda / rev if rev else 0
         net_margin    = ni     / rev if rev else 0
 
-        # Cash Flow
+        # ── Cash Flow ────────────────────────────────────────────────────────
         nwc_change = rev * nwc_pct
         capex_amt  = rev * capex_pct
 
         cfo = ni + da_amt - nwc_change
         cfi = -capex_amt
 
-        # Pre-CFF cash position
         pre_cff_cash = prev_cash + cfo + cfi
-
-        # Sweep surplus: if cash exceeds target, return excess via buybacks / debt paydown
-        if pre_cff_cash > cash_target:
-            cff = -(pre_cff_cash - cash_target)
-        else:
-            cff = 0.0
+        cff = -(pre_cff_cash - cash_target) if pre_cff_cash > cash_target else 0.0
 
         net_cash_change = cfo + cfi + cff
-        proj_cash = max(0, prev_cash + net_cash_change)  # floor at zero
+        proj_cash       = max(0, prev_cash + net_cash_change)
 
         fcf        = cfo + cfi
         fcf_margin = fcf / rev if rev else 0
 
-        # Balance Sheet roll-forward
+        # ── Balance Sheet ────────────────────────────────────────────────────
         proj_ppe      = max(0, prev_ppe + capex_amt - da_amt)
         proj_goodwill = prev_goodwill
 
-        rev_gr_factor = rev / prev_rev if prev_rev else 1.0
-        other_a_seed  = max(0, g("total_assets") - g("cash") - g("ppe") - g("goodwill"))
-        other_assets  = other_a_seed * rev_gr_factor
-        proj_total_assets = proj_cash + proj_ppe + proj_goodwill + other_assets
+        rev_gr_factor  = rev / prev_rev if prev_rev else 1.0
+        other_a_seed   = max(0, g("total_assets") - g("cash") - g("ppe") - g("goodwill"))
+        proj_total_assets = proj_cash + proj_ppe + proj_goodwill + other_a_seed * rev_gr_factor
 
-        # LTD: absorb sweep as debt paydown first, then equity return
         lt_debt_paydown = min(max(0, -cff), prev_ltd)
-        proj_ltd = max(0, prev_ltd - lt_debt_paydown)
+        proj_ltd        = max(0, prev_ltd - lt_debt_paydown)
 
         other_l_seed    = max(0, prev_tl - prev_ltd)
-        proj_other_liab = other_l_seed * rev_gr_factor
-        proj_total_liab = proj_ltd + proj_other_liab
+        proj_total_liab = proj_ltd + other_l_seed * rev_gr_factor
 
-        equity_reduction = max(0, -cff) - lt_debt_paydown
-        proj_equity = prev_equity + ni - max(0, equity_reduction)
+        equity_returned = max(0, max(0, -cff) - lt_debt_paydown)
+        proj_equity     = prev_equity + ni - equity_returned
 
         net_debt = proj_ltd - proj_cash
 
         proj[yr_label] = {
-            "revenue": rev, "cogs": cogs_amt, "labor": labor_amt,
-            "advertising": adv_amt, "store_opex": opex_amt,
-            "sga": sga_amt, "da": da_amt, "ebit": ebit,
-            "interest": int_amt, "tax": tax_amt, "net_income": ni,
-            "ebitda": ebitda, "ebitda_margin": ebitda_margin,
-            "net_margin": net_margin,
-            "cfo": cfo, "cfi": cfi, "cff": cff, "capex": cfi,
-            "fcf": fcf, "fcf_margin": fcf_margin,
-            "net_cash_change": net_cash_change,
-            "bs_cash": proj_cash, "bs_ppe": proj_ppe,
-            "bs_goodwill": proj_goodwill,
+            # Income Statement (expenses = positive gross amounts)
+            "revenue":        rev,
+            "cogs":           cogs_amt,
+            "labor":          labor_amt,
+            "advertising":    adv_amt,
+            "store_opex":     opex_amt,
+            "sga":            sga_amt,
+            "da":             da_amt,
+            "ebit":           ebit,
+            "interest":       int_amt,
+            "tax":            tax_amt,
+            "net_income":     ni,
+            "ebitda":         ebitda,
+            "ebitda_margin":  ebitda_margin,
+            "net_margin":     net_margin,
+            # Per-year effective rates for Excel assumptions block
+            "_rev_gr":    rev_gr,
+            "_cogs_pct":  cogs_adj,
+            "_labor_pct": labor_adj,
+            "_sga_pct":   sga_adj,
+            "_da_pct":    da_adj,
+            "_int_pct":   int_pct,
+            "_tax_rate":  tax_rate,
+            "_capex_pct": capex_pct,
+            "_nwc_pct":   nwc_pct,
+            # Cash Flow (CFI/CapEx negative = outflows)
+            "cfo":            cfo,
+            "cfi":            cfi,
+            "cff":            cff,
+            "capex":          cfi,
+            "fcf":            fcf,
+            "fcf_margin":     fcf_margin,
+            "net_cash_change":net_cash_change,
+            # Balance Sheet
+            "bs_cash":         proj_cash,
+            "bs_ppe":          proj_ppe,
+            "bs_goodwill":     proj_goodwill,
             "bs_total_assets": proj_total_assets,
-            "bs_ltd": proj_ltd, "bs_total_liab": proj_total_liab,
-            "bs_equity": proj_equity, "net_debt": net_debt,
-            # Store anchored drivers (used by Excel Assumptions block)
-            "_rev_gr": rev_gr, "_cogs_pct": cogs_pct, "_labor_pct": labor_pct,
-            "_sga_pct": sga_pct, "_da_pct": da_pct, "_int_pct": int_pct,
-            "_capex_pct": capex_pct, "_tax_rate": tax_rate, "_nwc_pct": nwc_pct,
+            "bs_ltd":          proj_ltd,
+            "bs_total_liab":   proj_total_liab,
+            "bs_equity":       proj_equity,
+            "net_debt":        net_debt,
         }
 
         prev_cash = proj_cash; prev_ppe = proj_ppe; prev_equity = proj_equity
-        prev_ltd = proj_ltd; prev_tl = proj_total_liab; prev_rev = rev
+        prev_ltd  = proj_ltd;  prev_tl  = proj_total_liab; prev_rev = rev
 
     return proj
 
@@ -1472,61 +1515,79 @@ def build_export_excel(companies: dict, metrics: dict, proj_data: dict) -> bytes
 
         # ════════════════════════════════════════════════════════════════════
         # SECTION A: ASSUMPTIONS SCHEDULE
-        # Yellow cells = editable driver inputs that match dashboard sliders.
-        # All projected IS / BS / CF cells reference these rows.
+        # Values here are the EXACT per-year effective rates used by the model.
+        # Year 1 matches slider directly; Years 2-3 reflect operating leverage.
+        # Yellow = editable; changing a cell updates the whole model column.
         # ════════════════════════════════════════════════════════════════════
-        section_hdr(ws, r, 2, col(n_all-1), "  A. ASSUMPTIONS & PROJECTION DRIVERS  (yellow = edit to update entire model)"); r += 1
+        section_hdr(ws, r, 2, col(n_all-1),
+                    "  A. ASSUMPTIONS & PROJECTION DRIVERS  (yellow = editable; all estimate cells reference these rows)"); r += 1
 
         label(ws, r, 2, "INCOME STATEMENT DRIVERS", bold=True, color=NAVY, bg=LGRAY)
         for i in range(n_all): ws.cell(r, col(i)).fill = F(LGRAY); ws.cell(r, col(i)).border = thin()
         r += 1
 
-        # Pull the EXACT blended driver values used by project_years for this ticker
-        # (same logic as project_years so Excel matches dashboard exactly)
-        first_proj_data = (proj_data.get(ticker, {}).get(proj_yrs[0], {}) if proj_yrs else {})
-        # The _rev_gr, _cogs_pct etc. keys are stored in proj_data by project_years
-        def _driver_val(key, fallback):
-            return first_proj_data.get(key, fallback)
-
-        def assum_row(key, lbl_txt, fmt, fallback):
-            """Write one assumption row using exact blended driver values from project_years."""
+        def assum_row(driver_key, lbl_txt, fmt, fallback):
+            """
+            Write one assumption row.
+            Historical columns: blank (not applicable).
+            Projection columns: exact effective rate from proj_data for that year.
+            Each year's value may differ (e.g. COGS declines with operating leverage).
+            """
             nonlocal r
             YELLOW = "FFFDE7"
             label(ws, r, 2, "  " + lbl_txt)
             for i in range(n_hist):
                 ws.cell(r, col(i)).fill = F(WHITE); ws.cell(r, col(i)).border = thin()
-            v = _driver_val(key, fallback)
-            for j in range(n_proj):
+            p = proj_data.get(ticker, {})
+            for j, yr in enumerate(proj_yrs):
+                # Use the per-year effective rate stored in proj_data
+                v = p.get(yr, {}).get(driver_key, fallback)
                 cell = ws.cell(r, col(n_hist + j), v)
                 cell.number_format = fmt
                 cell.font = Fn(color=BLUE); cell.fill = F(YELLOW)
                 cell.alignment = AR(); cell.border = thin()
             ws.row_dimensions[r].height = 15
-            R[f"assum_{key}"] = r; r += 1
+            R[f"assum_{driver_key}"] = r; r += 1
 
-        assum_row("_rev_gr",    "Revenue Growth Rate %",   FMT_PCT, 0.08)
-        assum_row("_cogs_pct",  "COGS % of Revenue",       FMT_PCT, 0.32)
-        assum_row("_labor_pct", "Labor % of Revenue",      FMT_PCT, 0.00)
-        assum_row("_sga_pct",   "SG and A % of Revenue",   FMT_PCT, 0.14)
-        assum_row("_da_pct",    "D and A % of Revenue",    FMT_PCT, 0.04)
-        assum_row("_int_pct",   "Interest % of Revenue",   FMT_PCT, 0.03)
-        assum_row("_tax_rate",  "Effective Tax Rate %",    FMT_PCT, 0.25)
+        assum_row("_rev_gr",    "Revenue Growth Rate %",       FMT_PCT, 0.08)
+        assum_row("_cogs_pct",  "COGS % of Revenue",           FMT_PCT, 0.32)
+        assum_row("_labor_pct", "Labor % of Revenue",          FMT_PCT, 0.00)
+        assum_row("_sga_pct",   "SG and A % of Revenue",       FMT_PCT, 0.14)
+        assum_row("_da_pct",    "D and A % of Revenue",        FMT_PCT, 0.04)
+        assum_row("_int_pct",   "Net Interest % of Revenue",   FMT_PCT, 0.03)
+        assum_row("_tax_rate",  "Effective Tax Rate %",        FMT_PCT, 0.25)
 
-        label(ws, r, 2, "BALANCE SHEET / CASH FLOW DRIVERS", bold=True, color=NAVY, bg=LGRAY)
+        label(ws, r, 2, "CASH FLOW AND BALANCE SHEET DRIVERS", bold=True, color=NAVY, bg=LGRAY)
         for i in range(n_all): ws.cell(r, col(i)).fill = F(LGRAY); ws.cell(r, col(i)).border = thin()
         r += 1
 
-        assum_row("_capex_pct", "CapEx % of Revenue",      FMT_PCT, 0.08)
-        assum_row("_nwc_pct",   "NWC Change % of Revenue", FMT_PCT, 0.01)
+        assum_row("_capex_pct", "CapEx % of Revenue",          FMT_PCT, 0.08)
+        assum_row("_nwc_pct",   "NWC Change % of Revenue",     FMT_PCT, 0.01)
+
+        # Advertising and store_opex are historical averages (not slider-driven)
+        # Show them as read-only context rows
+        for hist_key, lbl_txt in [("advertising", "Advertising % Rev (historical avg)"),
+                                    ("store_opex",  "Store OpEx % Rev (historical avg)")]:
+            avg_pct = _hist_avg(cdata, hist_key, 0.0)
+            label(ws, r, 2, "  " + lbl_txt, color=MGRAY)
+            for i in range(n_hist):
+                ws.cell(r, col(i)).fill = F(WHITE); ws.cell(r, col(i)).border = thin()
+            for j in range(n_proj):
+                cell = ws.cell(r, col(n_hist + j), avg_pct)
+                cell.number_format = FMT_PCT
+                cell.font = Fn(color=MGRAY, italic=True); cell.fill = F(LGRAY)
+                cell.alignment = AR(); cell.border = thin()
+            ws.row_dimensions[r].height = 15
+            R[f"assum_{hist_key}"] = r; r += 1
 
         spacer(ws, r); r += 1
 
         # ════════════════════════════════════════════════════════════════════
-        # Helper: build formula that refs assumption cell for proj years
+        # Helper: row-absolute reference to assumption cell
         # ════════════════════════════════════════════════════════════════════
         def assum_ref(assum_key, yr_idx):
-            """Row-absolute ref to assumption cell: e.g. F$6"""
-            c = cl(yr_idx)
+            """e.g. F$6 — column-relative, row-absolute reference."""
+            c     = cl(yr_idx)
             row_n = R[f"assum_{assum_key}"]
             return f"{c}${row_n}"
 
@@ -1535,45 +1596,44 @@ def build_export_excel(companies: dict, metrics: dict, proj_data: dict) -> bytes
         # ════════════════════════════════════════════════════════════════════
         section_hdr(ws, r, 2, col(n_all-1), "  B. INCOME STATEMENT"); r += 1
 
-        # Reserve the revenue row number BEFORE writing it so j=0 formula works
-        revenue_row_num = r   # will be written next
+        # Capture revenue row number before writing it (fixes the row-1 ref bug)
+        revenue_row_num = r
 
         def is_hist_proj_row(hist_key, lbl_txt, is_expense=False, indent=1):
             """
-            Historical years: hardcoded blue input.
-            Projected years: green formula referencing assumption + prior-year revenue.
-            revenue_row_num is captured in closure so revenue formula works at j=0.
+            Historical years: hardcoded blue input from raw data.
+            Projected years: green formula referencing assumption cells and
+            prior-year revenue, so changing an assumption cascades everywhere.
             """
             nonlocal r
             label(ws, r, 2, lbl_txt, indent=indent)
             d_raw = cdata["data"].get(hist_key, {})
-            # Historical columns
+            # Historical
             for i, yr in enumerate(yrs):
                 v = d_raw.get(yr, 0) or 0
                 inp_cell(ws, r, col(i), abs(v) if is_expense else v)
-            # Projected columns — green formulas
+            # Projected
             for j in range(n_proj):
                 idx = n_hist + j
                 rev_ref = f"{cl(idx)}{revenue_row_num}"
                 if hist_key == "revenue":
-                    if j == 0:
-                        # Prior year = last historical column
-                        prior_rev = f"{cl(n_hist - 1)}{revenue_row_num}"
-                    else:
-                        # Prior year = previous projection column
-                        prior_rev = f"{cl(idx - 1)}{revenue_row_num}"
-                    formula = f"={prior_rev}*(1+{assum_ref('_rev_gr', idx)})"
-                elif hist_key in ("cogs", "labor", "sga", "da", "interest"):
-                    key_map = {
-                        "cogs":     "_cogs_pct",
-                        "labor":    "_labor_pct",
-                        "sga":      "_sga_pct",
-                        "da":       "_da_pct",
-                        "interest": "_int_pct",
-                    }
-                    formula = f"={rev_ref}*{assum_ref(key_map[hist_key], idx)}"
+                    prior = f"{cl(idx-1)}{revenue_row_num}" if j > 0 else f"{cl(n_hist-1)}{revenue_row_num}"
+                    formula = f"={prior}*(1+{assum_ref('_rev_gr', idx)})"
+                elif hist_key == "cogs":
+                    formula = f"={rev_ref}*{assum_ref('_cogs_pct', idx)}"
+                elif hist_key == "labor":
+                    formula = f"={rev_ref}*{assum_ref('_labor_pct', idx)}"
+                elif hist_key == "sga":
+                    formula = f"={rev_ref}*{assum_ref('_sga_pct', idx)}"
+                elif hist_key == "da":
+                    formula = f"={rev_ref}*{assum_ref('_da_pct', idx)}"
+                elif hist_key == "interest":
+                    formula = f"={rev_ref}*{assum_ref('_int_pct', idx)}"
+                elif hist_key == "advertising":
+                    formula = f"={rev_ref}*{assum_ref('advertising', idx)}"
+                elif hist_key == "store_opex":
+                    formula = f"={rev_ref}*{assum_ref('store_opex', idx)}"
                 else:
-                    # Other lines: hold at last historical % of revenue
                     last_v = abs(d_raw.get(yrs[-1], 0) or 0)
                     last_r = abs(cdata["data"].get("revenue", {}).get(yrs[-1], 1) or 1)
                     pct    = last_v / last_r if last_r else 0
@@ -2052,16 +2112,21 @@ def main():
 
         st.divider()
         st.markdown("### 🎛️ Projection Drivers")
-        st.caption("Forecasts begin after the latest actual year in the data.")
+        st.caption(
+            "These exact values apply to all companies. "
+            "Advertising and store operating costs are held at each "
+            "company's own historical average. Margins expand ~50bps/yr "
+            "via operating leverage in Years 2 and 3."
+        )
 
-        rev_gr   = st.slider("Revenue Growth Rate %",  0,  40, 12, 1) / 100
-        cogs_pct = st.slider("Target COGS % Revenue",  10, 90, 32, 1) / 100
-        labor_pct = st.slider("Labor % Revenue",       0,  40,  8, 1) / 100
-        sga_pct  = st.slider("SG&A % Revenue",         3,  30, 14, 1) / 100
-        da_pct   = st.slider("D&A % Revenue",          1,  15,  5, 1) / 100
-        int_pct  = st.slider("Interest % Revenue",     0,  10,  3, 1) / 100
-        capex_pct = st.slider("CapEx % Revenue",       1,  30,  8, 1) / 100
-        tax_rate = st.slider("Effective Tax Rate %",   0,  40, 25, 1) / 100
+        rev_gr    = st.slider("Revenue Growth Rate %",  0,  40, 12, 1) / 100
+        cogs_pct  = st.slider("COGS % of Revenue",      5,  80, 32, 1) / 100
+        labor_pct = st.slider("Labor % of Revenue",     0,  40,  8, 1) / 100
+        sga_pct   = st.slider("SG&A % of Revenue",      3,  30, 14, 1) / 100
+        da_pct    = st.slider("D&A % of Revenue",       1,  15,  5, 1) / 100
+        int_pct   = st.slider("Interest % of Revenue",  0,  10,  3, 1) / 100
+        capex_pct = st.slider("CapEx % of Revenue",     1,  30,  8, 1) / 100
+        tax_rate  = st.slider("Effective Tax Rate %",   0,  40, 25, 1) / 100
 
         drivers = dict(
             rev_gr=rev_gr, cogs_pct=cogs_pct, labor_pct=labor_pct,
