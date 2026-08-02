@@ -849,7 +849,14 @@ def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
         da_amt   = rev * da_pct
         int_amt  = rev * int_pct
 
-        ebitda   = rev - cogs_amt - labor_amt - sga_amt
+        # Include advertising and store_opex at their historical average % of revenue
+        # so EBITDA reflects all operating costs, not just the main slider drivers
+        adv_pct    = _hist_pct(cdata, "advertising", 0.0)
+        opex_pct   = _hist_pct(cdata, "store_opex",  0.0)
+        adv_amt    = rev * adv_pct
+        opex_amt   = rev * opex_pct
+
+        ebitda = rev - cogs_amt - labor_amt - sga_amt - adv_amt - opex_amt
         ebit     = ebitda - da_amt
         ebt      = ebit - int_amt
         tax_amt  = max(0, ebt) * tax_rate
@@ -904,6 +911,7 @@ def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
 
         proj[yr_label] = {
             "revenue": rev, "cogs": cogs_amt, "labor": labor_amt,
+            "advertising": adv_amt, "store_opex": opex_amt,
             "sga": sga_amt, "da": da_amt, "ebit": ebit,
             "interest": int_amt, "tax": tax_amt, "net_income": ni,
             "ebitda": ebitda, "ebitda_margin": ebitda_margin,
@@ -1464,28 +1472,31 @@ def build_export_excel(companies: dict, metrics: dict, proj_data: dict) -> bytes
 
         # ════════════════════════════════════════════════════════════════════
         # SECTION A: ASSUMPTIONS SCHEDULE
-        # Projection drivers live here as editable blue cells.
-        # All projected IS / BS / CF cells reference these rows via $B$ anchors.
+        # Yellow cells = editable driver inputs that match dashboard sliders.
+        # All projected IS / BS / CF cells reference these rows.
         # ════════════════════════════════════════════════════════════════════
-        section_hdr(ws, r, 2, col(n_all-1), "  A. ASSUMPTIONS & PROJECTION DRIVERS  (edit yellow cells to update entire model)"); r += 1
+        section_hdr(ws, r, 2, col(n_all-1), "  A. ASSUMPTIONS & PROJECTION DRIVERS  (yellow = edit to update entire model)"); r += 1
 
         label(ws, r, 2, "INCOME STATEMENT DRIVERS", bold=True, color=NAVY, bg=LGRAY)
         for i in range(n_all): ws.cell(r, col(i)).fill = F(LGRAY); ws.cell(r, col(i)).border = thin()
         r += 1
 
-        # Assumption rows: blank for hist years, editable for proj years
+        # Pull the EXACT blended driver values used by project_years for this ticker
+        # (same logic as project_years so Excel matches dashboard exactly)
         first_proj_data = (proj_data.get(ticker, {}).get(proj_yrs[0], {}) if proj_yrs else {})
+        # The _rev_gr, _cogs_pct etc. keys are stored in proj_data by project_years
+        def _driver_val(key, fallback):
+            return first_proj_data.get(key, fallback)
 
-        def assum_row(key, lbl_txt, fmt, default_val):
-            """Write one assumption row. Hist=blank, proj=blue editable."""
+        def assum_row(key, lbl_txt, fmt, fallback):
+            """Write one assumption row using exact blended driver values from project_years."""
             nonlocal r
             YELLOW = "FFFDE7"
             label(ws, r, 2, "  " + lbl_txt)
             for i in range(n_hist):
                 ws.cell(r, col(i)).fill = F(WHITE); ws.cell(r, col(i)).border = thin()
+            v = _driver_val(key, fallback)
             for j in range(n_proj):
-                # Use anchored driver value from proj_data if available
-                v = first_proj_data.get(key, default_val)
                 cell = ws.cell(r, col(n_hist + j), v)
                 cell.number_format = fmt
                 cell.font = Fn(color=BLUE); cell.fill = F(YELLOW)
@@ -1512,58 +1523,59 @@ def build_export_excel(companies: dict, metrics: dict, proj_data: dict) -> bytes
 
         # ════════════════════════════════════════════════════════════════════
         # Helper: build formula that refs assumption cell for proj years
-        # For hist years, formula just equals the hard-coded input cell.
         # ════════════════════════════════════════════════════════════════════
-        def proj_col(j):
-            """Column letter for j-th projection year (0-based)."""
-            return cl(n_hist + j)
-
-        def prev_col(i):
-            """Column letter for year before index i."""
-            return cl(i - 1)
-
         def assum_ref(assum_key, yr_idx):
-            """Absolute ref to the assumption cell for this column."""
+            """Row-absolute ref to assumption cell: e.g. F$6"""
             c = cl(yr_idx)
-            row = R[f"assum_{assum_key}"]
-            return f"{c}${row}"    # column-relative, row-absolute
+            row_n = R[f"assum_{assum_key}"]
+            return f"{c}${row_n}"
 
         # ════════════════════════════════════════════════════════════════════
         # SECTION B: INCOME STATEMENT
         # ════════════════════════════════════════════════════════════════════
         section_hdr(ws, r, 2, col(n_all-1), "  B. INCOME STATEMENT"); r += 1
 
+        # Reserve the revenue row number BEFORE writing it so j=0 formula works
+        revenue_row_num = r   # will be written next
+
         def is_hist_proj_row(hist_key, lbl_txt, is_expense=False, indent=1):
             """
             Historical years: hardcoded blue input.
             Projected years: green formula referencing assumption + prior-year revenue.
+            revenue_row_num is captured in closure so revenue formula works at j=0.
             """
             nonlocal r
             label(ws, r, 2, lbl_txt, indent=indent)
             d_raw = cdata["data"].get(hist_key, {})
-            # Historical
+            # Historical columns
             for i, yr in enumerate(yrs):
                 v = d_raw.get(yr, 0) or 0
                 inp_cell(ws, r, col(i), abs(v) if is_expense else v)
-            # Projected (green = formula referencing assumptions)
+            # Projected columns — green formulas
             for j in range(n_proj):
                 idx = n_hist + j
-                rev_ref = f"{cl(idx)}{R['revenue']}" if "revenue" in R else None
+                rev_ref = f"{cl(idx)}{revenue_row_num}"
                 if hist_key == "revenue":
                     if j == 0:
-                        prev_rev = f"{cl(n_hist-1)}{R['revenue']}" if "revenue" in R else f"{cl(idx)}1"
-                        formula = f"={prev_rev}*(1+{assum_ref('_rev_gr', idx)})"
+                        # Prior year = last historical column
+                        prior_rev = f"{cl(n_hist - 1)}{revenue_row_num}"
                     else:
-                        formula = f"={cl(idx-1)}{r}*(1+{assum_ref('_rev_gr', idx)})"
-                elif hist_key in ("cogs","labor","sga","da","interest"):
-                    key_map = {"cogs":"_cogs_pct","labor":"_labor_pct","sga":"_sga_pct",
-                               "da":"_da_pct","interest":"_int_pct"}
-                    assum_k = key_map[hist_key]
-                    formula = f"={rev_ref}*{assum_ref(assum_k, idx)}"
+                        # Prior year = previous projection column
+                        prior_rev = f"{cl(idx - 1)}{revenue_row_num}"
+                    formula = f"={prior_rev}*(1+{assum_ref('_rev_gr', idx)})"
+                elif hist_key in ("cogs", "labor", "sga", "da", "interest"):
+                    key_map = {
+                        "cogs":     "_cogs_pct",
+                        "labor":    "_labor_pct",
+                        "sga":      "_sga_pct",
+                        "da":       "_da_pct",
+                        "interest": "_int_pct",
+                    }
+                    formula = f"={rev_ref}*{assum_ref(key_map[hist_key], idx)}"
                 else:
-                    # Other lines: grow with revenue
+                    # Other lines: hold at last historical % of revenue
                     last_v = abs(d_raw.get(yrs[-1], 0) or 0)
-                    last_r = abs(cdata["data"].get("revenue",{}).get(yrs[-1], 1) or 1)
+                    last_r = abs(cdata["data"].get("revenue", {}).get(yrs[-1], 1) or 1)
                     pct    = last_v / last_r if last_r else 0
                     formula = f"={rev_ref}*{pct:.6f}"
                 cell = ws.cell(r, col(idx), formula)
@@ -2308,18 +2320,28 @@ def main():
         proj_rows = []
         for ticker in active:
             for yr, pdata in active_proj[ticker].items():
-                rev_p = pdata.get("revenue", 0)
+                rev_p   = pdata.get("revenue",    1) or 1
+                ebitda_p = pdata.get("ebitda",    0)
+                ni_p    = pdata.get("net_income", 0)
+                fcf_p   = pdata.get("fcf",        0)
+                cfo_p   = pdata.get("cfo",        0)
+                # Always recompute ratios from raw values so they are clearly dynamic
+                em_p  = ebitda_p / rev_p
+                nm_p  = ni_p     / rev_p
+                fcfm_p = fcf_p   / rev_p
                 proj_rows.append({
                     "Ticker":            ticker,
                     "Year":              yr,
                     "Revenue ($M)":      f"${rev_p/1e3:.1f}M",
-                    "EBITDA Margin":     f"{pdata.get('ebitda_margin', 0):.1%}",
-                    "Net Income ($M)":   f"${pdata.get('net_income', 0)/1e3:.1f}M",
-                    "Net Margin %":      f"{pdata.get('net_margin', 0):.1%}",
-                    "FCF ($M)":          f"${pdata.get('fcf', 0)/1e3:.1f}M",
-                    "FCF Margin %":      f"{pdata.get('fcf_margin', 0):.1%}",
+                    "EBITDA ($M)":       f"${ebitda_p/1e3:.1f}M",
+                    "EBITDA Margin":     f"{em_p:.1%}",
+                    "Net Income ($M)":   f"${ni_p/1e3:.1f}M",
+                    "Net Margin":        f"{nm_p:.1%}",
+                    "FCF ($M)":          f"${fcf_p/1e3:.1f}M",
+                    "FCF Margin":        f"{fcfm_p:.1%}",
+                    "CFO ($M)":          f"${cfo_p/1e3:.1f}M",
                     "CFF ($M)":          f"${pdata.get('cff', 0)/1e3:.1f}M",
-                    "Proj Cash ($M)":    f"${pdata.get('bs_cash', 0)/1e3:.1f}M",
+                    "Cash ($M)":         f"${pdata.get('bs_cash', 0)/1e3:.1f}M",
                     "Net Debt ($M)":     f"${pdata.get('net_debt', 0)/1e3:.1f}M",
                 })
         proj_df = pd.DataFrame(proj_rows)
