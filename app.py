@@ -763,9 +763,22 @@ def compute_metrics(cdata: dict) -> dict:
 def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
     """
     Build projection years using sidebar driver assumptions.
+    Includes a fully projected Balance Sheet linked to the Income Statement
+    and Cash Flow Statement so all three statements balance each period.
 
-    Drivers expected:
-      rev_gr, cogs_pct, sga_pct, capex_pct, tax_rate, da_pct, labor_pct
+    Income Statement drivers:
+      rev_gr, cogs_pct, labor_pct, sga_pct, da_pct, int_pct, tax_rate
+
+    Balance Sheet roll-forward:
+      Cash    = prior cash + CFO + CFI + CFF
+      PP&E    = prior PP&E + CapEx - D&A  (net book value)
+      Equity  = prior equity + Net Income  (no dividends assumed unless specified)
+      Ltd     = held flat at last actual  (no new issuances / repayments modeled)
+
+    Cash Flow:
+      CFO     = Net Income + D&A - NWC build
+      CFI     = CapEx
+      CFF     = 0 (placeholder; override with share_repurchase driver if desired)
     """
     d, yrs = cdata["data"], cdata["years"]
     last_yr = yrs[-1]
@@ -773,36 +786,113 @@ def project_years(cdata: dict, drivers: dict, proj_labels: list[str]) -> dict:
     def g(key):
         return d.get(key, {}).get(last_yr, 0.0) or 0.0
 
+    # Seed balance sheet from last actual year
+    prev_cash    = g("cash")
+    prev_ppe     = g("ppe")
+    prev_goodwill= g("goodwill")
+    prev_equity  = g("equity")
+    prev_ltd     = g("ltd")
+    prev_tl      = g("total_liabilities")
+    prev_rev     = g("revenue")
+
     proj: dict[str, dict] = {}
-    prev_rev = g("revenue")
 
     for yr_label in proj_labels:
+        # ── Income Statement ─────────────────────────────────────────────────
         rev   = prev_rev * (1 + drivers["rev_gr"])
         cogs  = -rev * drivers["cogs_pct"]
         labor = -rev * drivers.get("labor_pct", 0.0)
         sga   = -rev * drivers["sga_pct"]
         da    = -rev * drivers.get("da_pct", 0.04)
-        ebit  = rev + cogs + labor + sga + da
+        ebitda = rev + cogs + labor + sga           # before D&A
+        ebit  = ebitda + da
         int_  = -rev * drivers.get("int_pct", 0.03)
         ebt   = ebit + int_
         tax   = -max(0, ebt) * drivers["tax_rate"]
         ni    = ebt + tax
-        cfo   = ni + abs(da) - rev * drivers.get("nwc_pct", 0.01)
-        capex = -rev * drivers["capex_pct"]
-        fcf   = cfo + capex
-        ebitda = rev + cogs + labor + sga
+        net_margin = ni / rev if rev else 0
+
+        # ── Cash Flow Statement ──────────────────────────────────────────────
+        da_abs  = abs(da)
+        nwc_chg = -rev * drivers.get("nwc_pct", 0.01)
+        capex   = -rev * drivers["capex_pct"]
+        cfo     = ni + da_abs + nwc_chg
+        cfi     = capex                             # investing = CapEx only
+        cff     = 0.0                               # financing flat (no debt assumed)
+        net_cash_change = cfo + cfi + cff
+
+        fcf    = cfo + capex
+        fcf_margin = fcf / rev if rev else 0
+
+        # ── Balance Sheet Roll-Forward ───────────────────────────────────────
+        proj_cash   = prev_cash + net_cash_change
+        proj_ppe    = max(0, prev_ppe + capex + da_abs)  # CapEx negative; da_abs positive
+        # Note: capex is negative, da_abs is positive, so:
+        #   proj_ppe = prior + (|CapEx| additions) - D&A depreciation
+        proj_ppe    = max(0, prev_ppe - abs(capex) - da_abs)
+        # Correct roll: additions INCREASE PPE; depreciation DECREASES it
+        proj_ppe    = max(0, prev_ppe + abs(capex) - da_abs)
+
+        proj_goodwill = prev_goodwill  # held flat (no new acquisitions)
+        # Other assets held proportional to revenue growth as a simple approximation
+        rev_growth_factor = rev / prev_rev if prev_rev else 1
+        other_assets_approx = max(0, g("total_assets")
+                                  - g("cash") - g("ppe") - g("goodwill")) * rev_growth_factor
+
+        proj_total_assets = proj_cash + proj_ppe + proj_goodwill + other_assets_approx
+
+        # Liabilities: LTD held flat; other liabilities grow with revenue
+        proj_ltd  = prev_ltd
+        other_liab_prior = max(0, prev_tl - prev_ltd)
+        proj_other_liab  = other_liab_prior * rev_growth_factor
+        proj_total_liab  = proj_ltd + proj_other_liab
+
+        # Equity: prior + net income (retained earnings roll)
+        proj_equity = prev_equity + ni
+
+        # Net debt: LTD minus cash (strict definition)
+        net_debt = proj_ltd - proj_cash
 
         proj[yr_label] = {
-            "revenue": rev, "cogs": cogs, "labor": labor,
-            "sga": sga, "da": da, "ebit": ebit,
-            "interest": int_, "tax": tax, "net_income": ni,
-            "cfo": cfo, "capex": capex, "fcf": fcf,
-            "ebitda": ebitda,
-            "ebitda_margin": ebitda / rev if rev else 0,
-            "fcf_margin": fcf / rev if rev else 0,
-            "net_debt": d.get("ltd",{}).get(last_yr,0) - (d.get("cash",{}).get(last_yr,0) + cfo),
+            # Income Statement
+            "revenue":      rev,
+            "cogs":         cogs,
+            "labor":        labor,
+            "sga":          sga,
+            "da":           da,
+            "ebit":         ebit,
+            "interest":     int_,
+            "tax":          tax,
+            "net_income":   ni,
+            "ebitda":       ebitda,
+            "ebitda_margin":ebitda / rev if rev else 0,
+            "net_margin":   net_margin,
+            # Cash Flow
+            "cfo":          cfo,
+            "cfi":          cfi,
+            "cff":          cff,
+            "capex":        capex,
+            "fcf":          fcf,
+            "fcf_margin":   fcf_margin,
+            "net_cash_change": net_cash_change,
+            # Balance Sheet
+            "bs_cash":      proj_cash,
+            "bs_ppe":       proj_ppe,
+            "bs_goodwill":  proj_goodwill,
+            "bs_total_assets":  proj_total_assets,
+            "bs_ltd":       proj_ltd,
+            "bs_total_liab":proj_total_liab,
+            "bs_equity":    proj_equity,
+            "net_debt":     net_debt,
         }
-        prev_rev = rev
+
+        # Roll forward for next period
+        prev_cash   = proj_cash
+        prev_ppe    = proj_ppe
+        prev_equity = proj_equity
+        prev_ltd    = proj_ltd
+        prev_tl     = proj_total_liab
+        prev_rev    = rev
 
     return proj
 
@@ -881,28 +971,39 @@ def build_is_df(cdata: dict, metrics: dict, proj: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_bs_df(cdata: dict) -> pd.DataFrame:
+def build_bs_df(cdata: dict, proj: dict = None) -> pd.DataFrame:
+    """
+    Build balance sheet DataFrame covering historical actuals and projected years.
+    Historical columns come from raw data; projected columns come from project_years output.
+    """
     d, yrs = cdata["data"], cdata["years"]
+    proj   = proj or {}
+    proj_yrs = list(proj.keys())
+
     bs_lines = [
-        ("cash",             "Cash and Cash Equivalents"),
-        ("ppe",              "Property and Equipment Net"),
-        ("goodwill",         "Goodwill and Intangibles"),
-        ("total_assets",     "Total Assets"),
-        ("ltd",              "Long-Term Debt"),
-        ("total_liabilities","Total Liabilities"),
-        ("equity",           "Total Equity"),
-        ("_net_debt",        "Net Debt (LTD minus Cash)"),
+        ("cash",             "Cash and Cash Equivalents",     "bs_cash"),
+        ("ppe",              "Property and Equipment Net",    "bs_ppe"),
+        ("goodwill",         "Goodwill and Intangibles",       "bs_goodwill"),
+        ("total_assets",     "Total Assets",                  "bs_total_assets"),
+        ("ltd",              "Long-Term Debt",                 "bs_ltd"),
+        ("total_liabilities","Total Liabilities",             "bs_total_liab"),
+        ("equity",           "Total Equity",                  "bs_equity"),
+        ("_net_debt",        "Net Debt (LTD minus Cash)",     "net_debt"),
     ]
     rows = []
-    for key, lbl in bs_lines:
+    for hist_key, lbl, proj_key in bs_lines:
         row = {"Line Item": lbl}
+        # Historical actuals
         for yr in yrs:
-            if key == "_net_debt":
+            if hist_key == "_net_debt":
                 ltd  = d.get("ltd",  {}).get(yr, 0) or 0
                 cash = d.get("cash", {}).get(yr, 0) or 0
                 row[yr] = ltd - cash
             else:
-                row[yr] = d.get(key, {}).get(yr, 0) or 0
+                row[yr] = d.get(hist_key, {}).get(yr, 0) or 0
+        # Projected years from project_years output
+        for yr in proj_yrs:
+            row[yr] = proj[yr].get(proj_key, 0)
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -910,10 +1011,12 @@ def build_bs_df(cdata: dict) -> pd.DataFrame:
 def build_cf_df(cdata: dict, metrics: dict, proj: dict) -> pd.DataFrame:
     d, yrs = cdata["data"], cdata["years"]
     cf_lines = [
-        ("cfo",   "Operating Cash Flow"),
-        ("capex", "Capital Expenditures"),
-        ("_fcf",  "Free Cash Flow"),
-        ("cff",   "Cash Flow from Financing"),
+        ("cfo",             "Operating Cash Flow (CFO)"),
+        ("capex",           "Capital Expenditures"),
+        ("_fcf",            "Free Cash Flow"),
+        ("cff",             "Cash Flow from Financing (CFF)"),
+        ("_net_cash_change","Net Change in Cash"),
+        ("_net_margin",     "Net Margin %"),
     ]
     rows = []
     for key, lbl in cf_lines:
@@ -921,11 +1024,23 @@ def build_cf_df(cdata: dict, metrics: dict, proj: dict) -> pd.DataFrame:
         for yr in yrs:
             if key == "_fcf":
                 row[yr] = metrics.get(yr, {}).get("fcf", 0)
+            elif key == "_net_cash_change":
+                # Historical: CFO + CapEx + CFF if available
+                cfo_v   = d.get("cfo",  {}).get(yr, 0) or 0
+                capex_v = d.get("capex",{}).get(yr, 0) or 0
+                cff_v   = d.get("cff",  {}).get(yr, 0) or 0
+                row[yr] = cfo_v + capex_v + cff_v
+            elif key == "_net_margin":
+                row[yr] = metrics.get(yr, {}).get("net_margin", 0)
             else:
                 row[yr] = d.get(key, {}).get(yr, 0) or 0
         for yr, pdata in proj.items():
             if key == "_fcf":
                 row[yr] = pdata.get("fcf", 0)
+            elif key == "_net_cash_change":
+                row[yr] = pdata.get("net_cash_change", 0)
+            elif key == "_net_margin":
+                row[yr] = pdata.get("net_margin", 0)
             elif key in pdata:
                 row[yr] = pdata[key]
             else:
@@ -1244,7 +1359,7 @@ def build_export_excel(companies: dict, metrics: dict, proj_data: dict) -> bytes
         r += 1
 
         is_df  = build_is_df(cdata, metrics[ticker], proj_data.get(ticker, {}))
-        bs_df  = build_bs_df(cdata)
+        bs_df  = build_bs_df(cdata, proj_data.get(ticker, {}))
         cf_df  = build_cf_df(cdata, metrics[ticker], proj_data.get(ticker, {}))
 
         for section_title, df in [
@@ -1255,7 +1370,7 @@ def build_export_excel(companies: dict, metrics: dict, proj_data: dict) -> bytes
             ws.merge_cells(f"B{r}:{gcl(2+len(all_yrs))}{r}")
             hdr_cell(ws, r, 2, f"  {section_title}", STEEL)
             r += 1
-            pct_rows = ["EBITDA Margin", "Net Margin", "FCF Margin"]
+            pct_rows = ["EBITDA Margin", "Net Margin", "Net Margin %", "FCF Margin"]
             r = write_section(ws, r, df, pct_rows)
             r += 1
 
@@ -1568,27 +1683,35 @@ def main():
     # TAB 2: EXECUTIVE OVERVIEW
     # ══════════════════════════════════════════════════════════════════════════
     with tab2:
-        # KPI Cards
+        # KPI Cards — always show latest actual (historical) year
         for ticker, cdata in active.items():
-            st.markdown(f'<div class="section-hdr">{ticker}</div>', unsafe_allow_html=True)
-            last_yr = cdata["years"][-1]
-            m = active_metrics[ticker].get(last_yr, {})
-            rev  = cdata["data"].get("revenue",    {}).get(last_yr, 0)
-            ni   = cdata["data"].get("net_income", {}).get(last_yr, 0)
-            ltd  = cdata["data"].get("ltd",        {}).get(last_yr, 0)
-            cash = cdata["data"].get("cash",       {}).get(last_yr, 0)
+            # latest_actual_year is the last year in cdata["years"] (historical only)
+            last_actual = cdata["years"][-1]
+            m   = active_metrics[ticker].get(last_actual, {})
+            rev  = cdata["data"].get("revenue",    {}).get(last_actual, 0) or 0
+            ni   = cdata["data"].get("net_income", {}).get(last_actual, 0) or 0
+            ltd  = cdata["data"].get("ltd",        {}).get(last_actual, 0) or 0
+            cash = cdata["data"].get("cash",       {}).get(last_actual, 0) or 0
             nd   = ltd - cash
 
-            c1,c2,c3,c4,c5 = st.columns(5)
-            kpi_card(c1, f"Net Revenue ({last_yr})", fmt_val(rev))
+            st.markdown(
+                f'<div class="section-hdr">{ticker} '
+                f'<span style="font-size:11px;color:#7F9DBF;font-weight:400;">'
+                f'Latest Actual: {last_actual}</span></div>',
+                unsafe_allow_html=True,
+            )
+            c1, c2, c3, c4, c5 = st.columns(5)
+            kpi_card(c1, f"Net Revenue ({last_actual})", fmt_val(rev))
             kpi_card(c2, "EBITDA Margin",
-                     f"{m.get('ebitda_margin',0):.1%}",
-                     delta="vs industry ~15%" if m.get('ebitda_margin',0) > 0.15 else "")
-            kpi_card(c3, "Free Cash Flow", fmt_val(m.get("fcf",0)),
-                     neg=(m.get("fcf",0) < 0))
-            kpi_card(c4, "Net Debt (LTD minus Cash)", fmt_val(nd),
-                     neg=(nd > 0))
-            kpi_card(c5, "Net Income", fmt_val(ni), neg=(ni < 0))
+                     f"{m.get('ebitda_margin', 0):.1%}",
+                     delta="vs industry ~15%" if m.get("ebitda_margin", 0) > 0.15 else "")
+            kpi_card(c3, "Net Income",
+                     fmt_val(ni),
+                     delta=f"Net Margin {m.get('net_margin', 0):.1%}",
+                     neg=(ni < 0))
+            kpi_card(c4, "Net Debt (LTD minus Cash)", fmt_val(nd), neg=(nd > 0))
+            kpi_card(c5, "Free Cash Flow", fmt_val(m.get("fcf", 0)),
+                     neg=(m.get("fcf", 0) < 0))
 
         # Cross-company benchmarking table
         st.markdown('<div class="section-hdr">Cross-Company Benchmarking Matrix</div>',
@@ -1596,47 +1719,57 @@ def main():
 
         bench_rows = []
         for ticker, cdata in active.items():
-            last_yr = cdata["years"][-1]
-            m = active_metrics[ticker].get(last_yr, {})
-            rev = cdata["data"].get("revenue",{}).get(last_yr,0)
-            ni  = cdata["data"].get("net_income",{}).get(last_yr,0)
-            ltd = cdata["data"].get("ltd",{}).get(last_yr,0)
-            csh = cdata["data"].get("cash",{}).get(last_yr,0)
+            last_actual = cdata["years"][-1]
+            m   = active_metrics[ticker].get(last_actual, {})
+            rev = cdata["data"].get("revenue",    {}).get(last_actual, 0) or 0
+            ni  = cdata["data"].get("net_income", {}).get(last_actual, 0) or 0
+            ltd = cdata["data"].get("ltd",        {}).get(last_actual, 0) or 0
+            csh = cdata["data"].get("cash",       {}).get(last_actual, 0) or 0
             bench_rows.append({
                 "Ticker":           ticker,
-                "Year":             last_yr,
+                "Latest Year":      last_actual,
                 "Net Revenue ($M)": f"${rev/1e3:.1f}M",
-                "EBITDA Margin":    f"{m.get('ebitda_margin',0):.1%}",
-                "Net Margin":       f"{m.get('net_margin',0):.1%}",
-                "FCF ($M)":         f"${m.get('fcf',0)/1e3:.1f}M",
-                "FCF Margin":       f"{m.get('fcf_margin',0):.1%}",
-                "Prime Cost Pct":   f"{m.get('prime_cost_pct',0):.1%}",
-                "Net Debt ($M)":    f"${(ltd-csh)/1e3:.1f}M",
-                "CapEx Pct Rev":    f"{m.get('capex_pct',0):.1%}",
+                "EBITDA Margin":    f"{m.get('ebitda_margin', 0):.1%}",
+                "Net Margin":       f"{m.get('net_margin', 0):.1%}",
+                "Net Income ($M)":  f"${ni/1e3:.1f}M",
+                "FCF ($M)":         f"${m.get('fcf', 0)/1e3:.1f}M",
+                "FCF Margin":       f"{m.get('fcf_margin', 0):.1%}",
+                "Prime Cost Pct":   f"{m.get('prime_cost_pct', 0):.1%}",
+                "Net Debt ($M)":    f"${(ltd - csh)/1e3:.1f}M",
+                "CapEx Pct Rev":    f"{m.get('capex_pct', 0):.1%}",
             })
 
         bench_df = pd.DataFrame(bench_rows)
         st.dataframe(bench_df, hide_index=True, use_container_width=True,
-                     height=min(180, 60 + 35 * len(bench_rows)))
+                     height=min(200, 60 + 35 * len(bench_rows)))
 
-        # Projection summary
-        st.markdown(f'<div class="section-hdr">{proj_labels[0]} to {proj_labels[-1]} Projection Summary</div>',
-                    unsafe_allow_html=True)
+        # Projection summary — includes Net Margin and CFF
+        st.markdown(
+            f'<div class="section-hdr">'
+            f'{proj_labels[0]} to {proj_labels[-1]} Projection Summary</div>',
+            unsafe_allow_html=True,
+        )
 
         proj_rows = []
-        for ticker, cdata in active.items():
+        for ticker in active:
             for yr, pdata in active_proj[ticker].items():
+                rev_p = pdata.get("revenue", 0)
                 proj_rows.append({
-                    "Ticker": ticker, "Year": yr,
-                    "Revenue ($M)":    f"${pdata['revenue']/1e3:.1f}M",
-                    "EBITDA Margin":   f"{pdata['ebitda_margin']:.1%}",
-                    "Net Income ($M)": f"${pdata['net_income']/1e3:.1f}M",
-                    "FCF ($M)":        f"${pdata['fcf']/1e3:.1f}M",
-                    "FCF Margin":      f"{pdata['fcf_margin']:.1%}",
+                    "Ticker":            ticker,
+                    "Year":              yr,
+                    "Revenue ($M)":      f"${rev_p/1e3:.1f}M",
+                    "EBITDA Margin":     f"{pdata.get('ebitda_margin', 0):.1%}",
+                    "Net Income ($M)":   f"${pdata.get('net_income', 0)/1e3:.1f}M",
+                    "Net Margin %":      f"{pdata.get('net_margin', 0):.1%}",
+                    "FCF ($M)":          f"${pdata.get('fcf', 0)/1e3:.1f}M",
+                    "FCF Margin %":      f"{pdata.get('fcf_margin', 0):.1%}",
+                    "CFF ($M)":          f"${pdata.get('cff', 0)/1e3:.1f}M",
+                    "Proj Cash ($M)":    f"${pdata.get('bs_cash', 0)/1e3:.1f}M",
+                    "Net Debt ($M)":     f"${pdata.get('net_debt', 0)/1e3:.1f}M",
                 })
         proj_df = pd.DataFrame(proj_rows)
         st.dataframe(proj_df, hide_index=True, use_container_width=True,
-                     height=min(350, 60 + 35 * len(proj_rows)))
+                     height=min(400, 60 + 35 * len(proj_rows)))
 
     # ══════════════════════════════════════════════════════════════════════════
     # TAB 3: 3-STATEMENT MODEL
@@ -1648,10 +1781,10 @@ def main():
         cproj  = active_proj[company_sel]
 
         is_df  = build_is_df(cdata, cmets, cproj)
-        bs_df  = build_bs_df(cdata)
+        bs_df  = build_bs_df(cdata, cproj)
         cf_df  = build_cf_df(cdata, cmets, cproj)
 
-        pct_rows = ["EBITDA Margin", "Net Margin"]
+        pct_rows = ["EBITDA Margin", "Net Margin", "Net Margin %"]
 
         def display_stmt(df, title):
             st.markdown(f'<div class="section-hdr">{title}</div>',
